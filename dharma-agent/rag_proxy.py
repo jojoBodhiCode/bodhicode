@@ -140,7 +140,7 @@ def chat_completions():
     is_streaming = body.get("stream", False)
 
     if is_streaming:
-        # Stream the response back chunk-by-chunk
+        # Stream the response back as Server-Sent Events (SSE)
         resp = http_requests.post(
             f"{BACKEND_URL}/v1/chat/completions",
             json=body,
@@ -148,10 +148,24 @@ def chat_completions():
             stream=True,
             timeout=600,
         )
+
+        def generate_sse():
+            """Yield SSE lines as they arrive from llama-server."""
+            for line in resp.iter_lines():
+                if line:
+                    yield line + b"\n\n"
+                else:
+                    yield b"\n"
+
         return Response(
-            resp.iter_content(chunk_size=None),
+            generate_sse(),
             status=resp.status_code,
-            content_type=resp.headers.get("Content-Type", "text/event-stream"),
+            content_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
     else:
         # Non-streaming: forward and return
