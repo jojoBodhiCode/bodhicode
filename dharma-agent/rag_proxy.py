@@ -17,12 +17,10 @@ Then open http://localhost:8081 in your browser for the RAG-augmented llama.cpp 
 import argparse
 import json
 import sys
-
-try:
-    from flask import Flask, request, Response
-except ImportError:
-    print("Missing 'flask'. Install with: pip install flask")
-    sys.exit(1)
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, urljoin
+from io import BytesIO
 
 try:
     import requests as http_requests
@@ -32,26 +30,32 @@ except ImportError:
 
 from prompts import SYSTEM_PROMPT
 
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+BACKEND_URL = "http://127.0.0.1:8080"
+
 # ─── RAG setup (lazy-loaded) ─────────────────────────────────────────────────
 
 _rag_instance = None
+_rag_lock = threading.Lock()
 
 
 def get_rag():
     """Lazy-load the RAG module. Returns None if unavailable."""
     global _rag_instance
-    if _rag_instance is None:
-        try:
-            from rag import DharmaRAG
-            _rag_instance = DharmaRAG()
-            count = _rag_instance.collection.count()
-            if count > 0:
-                print(f"  [RAG] Knowledge base loaded: {count} chunks")
-            else:
-                print("  [RAG] Knowledge base is empty -- responses will not be grounded.")
-        except Exception as e:
-            print(f"  [RAG] Could not load knowledge base: {e}")
-            return None
+    with _rag_lock:
+        if _rag_instance is None:
+            try:
+                from rag import DharmaRAG
+                _rag_instance = DharmaRAG()
+                count = _rag_instance.collection.count()
+                if count > 0:
+                    print(f"  [RAG] Knowledge base loaded: {count} chunks")
+                else:
+                    print("  [RAG] Knowledge base is empty -- responses will not be grounded.")
+            except Exception as e:
+                print(f"  [RAG] Could not load knowledge base: {e}")
+                return None
     return _rag_instance
 
 
@@ -65,13 +69,11 @@ def augment_messages(messages):
     rag = get_rag()
     sources = []
 
-    # 1. Ensure system prompt is present
+    # 1. Ensure system prompt is present / replace default
     has_system = any(m.get("role") == "system" for m in messages)
     if not has_system:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
     else:
-        # Replace the first system message with our Dharma Scholar prompt
-        # (the llama.cpp UI sends a default "You are a helpful assistant" system msg)
         augmented = []
         replaced = False
         for m in messages:
@@ -100,7 +102,7 @@ def augment_messages(messages):
                     "Ground your response in these sources and cite them where appropriate.\n\n"
                     f"{context}\n\n---\n\n{user_text}"
                 )
-                messages = list(messages)  # copy
+                messages = list(messages)
                 messages[last_user_idx] = {
                     "role": "user",
                     "content": augmented_content,
@@ -109,23 +111,8 @@ def augment_messages(messages):
     return messages, sources
 
 
-# ─── Flask proxy ──────────────────────────────────────────────────────────────
-
-app = Flask(__name__)
-BACKEND_URL = "http://127.0.0.1:8080"  # overridden by --backend arg
-
-
-@app.route("/v1/chat/completions", methods=["POST"])
-def chat_completions():
-    """Intercept chat completions: inject RAG context, then forward."""
-    body = request.get_json(force=True)
-    messages = body.get("messages", [])
-
-    # Augment with system prompt + RAG
-    augmented_messages, sources = augment_messages(messages)
-    body["messages"] = augmented_messages
-
-    # Log what we retrieved
+def log_sources(sources):
+    """Log retrieved sources to console."""
     if sources:
         source_ids = []
         for s in sources:
@@ -136,79 +123,144 @@ def chat_completions():
     else:
         print("  [RAG] No sources retrieved for this query.")
 
-    # Check if streaming is requested
-    is_streaming = body.get("stream", False)
 
-    if is_streaming:
-        # Stream the response back as Server-Sent Events (SSE)
-        resp = http_requests.post(
-            f"{BACKEND_URL}/v1/chat/completions",
-            json=body,
-            headers={"Content-Type": "application/json"},
-            stream=True,
-            timeout=600,
-        )
+# ─── HTTP Proxy Handler ──────────────────────────────────────────────────────
 
-        def generate_sse():
-            """Yield SSE lines as they arrive from llama-server."""
-            for line in resp.iter_lines():
-                if line:
-                    yield line + b"\n\n"
-                else:
-                    yield b"\n"
+class RAGProxyHandler(BaseHTTPRequestHandler):
+    """HTTP request handler that proxies to llama-server with RAG injection."""
 
-        return Response(
-            generate_sse(),
-            status=resp.status_code,
-            content_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-    else:
-        # Non-streaming: forward and return
-        resp = http_requests.post(
-            f"{BACKEND_URL}/v1/chat/completions",
-            json=body,
-            headers={"Content-Type": "application/json"},
-            timeout=600,
-        )
-        return Response(
-            resp.content,
-            status=resp.status_code,
-            content_type=resp.headers.get("Content-Type", "application/json"),
-        )
+    def log_message(self, format, *args):
+        """Custom log format."""
+        print(f"  {self.client_address[0]} - {format % args}")
 
+    def _forward_request(self, method):
+        """Forward a request to the backend, with RAG injection for chat completions."""
+        path = self.path
+        target_url = f"{BACKEND_URL}{path}"
 
-@app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-@app.route("/<path:path>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-def proxy_all(path):
-    """Forward all other requests to llama-server unchanged."""
-    target_url = f"{BACKEND_URL}/{path}"
+        # Read request body if present
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length) if content_length > 0 else b""
 
-    # Forward with same method, headers, query params, and body
-    resp = http_requests.request(
-        method=request.method,
-        url=target_url,
-        headers={k: v for k, v in request.headers if k.lower() != "host"},
-        params=request.args,
-        data=request.get_data(),
-        stream=True,
-        timeout=30,
-    )
+        # Check if this is a chat completions request
+        is_chat = (path == "/v1/chat/completions" and method == "POST")
 
-    # Build excluded headers (hop-by-hop)
-    excluded = {"transfer-encoding", "connection", "content-encoding", "content-length"}
-    headers = [(k, v) for k, v in resp.raw.headers.items() if k.lower() not in excluded]
+        if is_chat:
+            self._handle_chat_completions(body)
+        else:
+            self._handle_passthrough(method, target_url, body)
 
-    return Response(
-        resp.iter_content(chunk_size=None),
-        status=resp.status_code,
-        headers=headers,
-        content_type=resp.headers.get("Content-Type"),
-    )
+    def _handle_chat_completions(self, raw_body):
+        """Handle chat completions with RAG injection and proper SSE streaming."""
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON")
+            return
+
+        messages = body.get("messages", [])
+        augmented_messages, sources = augment_messages(messages)
+        body["messages"] = augmented_messages
+        log_sources(sources)
+
+        is_streaming = body.get("stream", False)
+
+        try:
+            resp = http_requests.post(
+                f"{BACKEND_URL}/v1/chat/completions",
+                json=body,
+                headers={"Content-Type": "application/json"},
+                stream=is_streaming,
+                timeout=600,
+            )
+        except Exception as e:
+            print(f"  [ERROR] Backend request failed: {e}")
+            self.send_error(502, f"Backend error: {e}")
+            return
+
+        if is_streaming:
+            # Send response headers immediately
+            self.send_response(resp.status_code)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+
+            # Stream SSE chunks directly to the socket, flushing each one
+            try:
+                for chunk in resp.iter_content(chunk_size=None):
+                    if chunk:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # Client disconnected
+            finally:
+                resp.close()
+        else:
+            # Non-streaming: send full response
+            self.send_response(resp.status_code)
+            self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+            content = resp.content
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+
+    def _handle_passthrough(self, method, target_url, body):
+        """Forward a non-chat request to the backend unchanged."""
+        # Build headers, skip hop-by-hop
+        skip = {"host", "transfer-encoding", "connection"}
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in skip}
+
+        try:
+            resp = http_requests.request(
+                method=method,
+                url=target_url,
+                headers=headers,
+                data=body if body else None,
+                stream=True,
+                timeout=30,
+            )
+        except Exception as e:
+            self.send_error(502, f"Backend error: {e}")
+            return
+
+        # Send response
+        self.send_response(resp.status_code)
+        skip_resp = {"transfer-encoding", "connection", "content-encoding"}
+        for k, v in resp.headers.items():
+            if k.lower() not in skip_resp:
+                self.send_header(k, v)
+        self.end_headers()
+
+        # Stream response body
+        try:
+            for chunk in resp.iter_content(chunk_size=8192):
+                if chunk:
+                    self.wfile.write(chunk)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            resp.close()
+
+    def do_GET(self):
+        self._forward_request("GET")
+
+    def do_POST(self):
+        self._forward_request("POST")
+
+    def do_PUT(self):
+        self._forward_request("PUT")
+
+    def do_DELETE(self):
+        self._forward_request("DELETE")
+
+    def do_OPTIONS(self):
+        self._forward_request("OPTIONS")
+
+    def do_PATCH(self):
+        self._forward_request("PATCH")
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -234,7 +286,6 @@ def main():
     args = parser.parse_args()
     BACKEND_URL = args.backend.rstrip("/")
 
-    # Eagerly load RAG so the embedding model is ready before first request
     print("\n  ╔══════════════════════════════════════════════════════════╗")
     print("  ║     Dharma Scholar — RAG Proxy for llama.cpp UI        ║")
     print("  ╚══════════════════════════════════════════════════════════╝\n")
@@ -242,11 +293,39 @@ def main():
     print(f"  Proxy:    http://{args.host}:{args.port}")
     print()
 
-    get_rag()  # pre-load embedding model
+    # Pre-load RAG so embedding model is ready before first request
+    get_rag()
 
     print(f"\n  Open http://localhost:{args.port} in your browser.\n")
 
-    app.run(host=args.host, port=args.port, debug=False, threaded=True)
+    # Use ThreadingHTTPServer for concurrent requests
+    class ThreadedHTTPServer(HTTPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+        def process_request(self, request, client_address):
+            """Handle each request in a new thread."""
+            t = threading.Thread(target=self._handle, args=(request, client_address))
+            t.daemon = True
+            t.start()
+
+        def _handle(self, request, client_address):
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
+            finally:
+                self.shutdown_request(request)
+
+    server = ThreadedHTTPServer((args.host, args.port), RAGProxyHandler)
+    print(f"  Serving on http://{args.host}:{args.port} ...")
+    print("  Press Ctrl+C to stop.\n")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n  Shutting down...")
+        server.shutdown()
 
 
 if __name__ == "__main__":
