@@ -1,6 +1,10 @@
 # llama.cpp binaries and archives
 llama-b7664-bin-win-cpu-x64/
 llama-b7664-bin-win-cpu-x64.zip
+llama-b7664-bin-win-cuda-12.4-x64/
+llama-b7664-bin-win-cuda-12.4-x64.zip
+cudart-llama-bin-win-cuda-12.4-x64/
+cudart-llama-bin-win-cuda-12.4-x64.zip
 
 # Model files (large, not for git)
 models/
