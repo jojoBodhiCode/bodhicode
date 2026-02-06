@@ -43,10 +43,12 @@ DEFAULT_COLLECTION = "buddhist_texts"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 if torch.cuda.is_available():
     _DEVICE = "cuda:0"
-    BATCH_SIZE = 64  # conservative for 2GB VRAM GPUs
+    BATCH_SIZE = 32
+    _ENCODE_BATCH = 16  # small encode batches for 2GB VRAM
 else:
     _DEVICE = "cpu"
     BATCH_SIZE = 100
+    _ENCODE_BATCH = 64
 
 
 class DharmaRAG:
@@ -93,7 +95,7 @@ class DharmaRAG:
           - "search_query: " for queries at retrieval time
         """
         prefixed = [f"{prefix}{t}" for t in texts]
-        embeddings = self.embedder.encode(prefixed, show_progress_bar=len(texts) > 50)
+        embeddings = self.embedder.encode(prefixed, batch_size=_ENCODE_BATCH, show_progress_bar=len(texts) > 50)
         return embeddings.tolist()
 
     def index_chunks(self, chunks: List[TextChunk], show_progress: bool = True) -> int:
