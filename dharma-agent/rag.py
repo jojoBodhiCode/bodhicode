@@ -41,8 +41,12 @@ from ingest.ingest_common import TextChunk
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "chroma_buddhist_db")
 DEFAULT_COLLECTION = "buddhist_texts"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 500 if _DEVICE == "cuda" else 100
+if torch.cuda.is_available():
+    _DEVICE = "cuda:0"
+    BATCH_SIZE = 64  # conservative for 2GB VRAM GPUs
+else:
+    _DEVICE = "cpu"
+    BATCH_SIZE = 100
 
 
 class DharmaRAG:
