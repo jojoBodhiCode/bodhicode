@@ -15,12 +15,12 @@ Then open http://localhost:8081 in your browser for the RAG-augmented llama.cpp 
 """
 
 import argparse
+import http.client
 import json
 import sys
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, urljoin
-from io import BytesIO
+from urllib.parse import urlparse
 
 try:
     import requests as http_requests
@@ -163,45 +163,66 @@ class RAGProxyHandler(BaseHTTPRequestHandler):
         body["messages"] = augmented_messages
         log_sources(sources)
 
-        is_streaming = body.get("stream", False)
+        # Force non-streaming: the proxy collects the full response and sends it back.
+        # This avoids SSE buffering issues. The UI will display the response once complete.
+        was_streaming = body.get("stream", False)
+        body["stream"] = False
+        payload = json.dumps(body).encode("utf-8")
 
+        parsed = urlparse(BACKEND_URL)
         try:
-            resp = http_requests.post(
-                f"{BACKEND_URL}/v1/chat/completions",
-                json=body,
-                headers={"Content-Type": "application/json"},
-                stream=is_streaming,
-                timeout=600,
+            conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=600)
+            conn.request(
+                "POST", "/v1/chat/completions",
+                body=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                },
             )
+            upstream = conn.getresponse()
+            content = upstream.read()
+            conn.close()
         except Exception as e:
             print(f"  [ERROR] Backend request failed: {e}")
             self.send_error(502, f"Backend error: {e}")
             return
 
-        if is_streaming:
-            # Send response headers immediately
-            self.send_response(resp.status_code)
+        if was_streaming:
+            # The UI expects SSE format, so convert the single response into SSE
+            try:
+                resp_json = json.loads(content)
+                # Convert chat.completion to chat.completion.chunk format for SSE
+                chunk_data = {
+                    "id": resp_json.get("id", "chatcmpl-proxy"),
+                    "object": "chat.completion.chunk",
+                    "created": resp_json.get("created", 0),
+                    "model": resp_json.get("model", ""),
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": resp_json["choices"][0]["message"]["content"],
+                        },
+                        "finish_reason": "stop",
+                    }],
+                }
+                sse_body = f"data: {json.dumps(chunk_data)}\n\ndata: [DONE]\n\n"
+                sse_bytes = sse_body.encode("utf-8")
+            except (json.JSONDecodeError, KeyError, IndexError) as e:
+                print(f"  [ERROR] Failed to convert response to SSE: {e}")
+                sse_bytes = content  # Fall back to raw response
+
+            self.send_response(upstream.status)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "keep-alive")
-            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Content-Length", str(len(sse_bytes)))
             self.end_headers()
-
-            # Stream SSE chunks directly to the socket, flushing each one
-            try:
-                for chunk in resp.iter_content(chunk_size=None):
-                    if chunk:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass  # Client disconnected
-            finally:
-                resp.close()
+            self.wfile.write(sse_bytes)
+            self.wfile.flush()
         else:
-            # Non-streaming: send full response
-            self.send_response(resp.status_code)
-            self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
-            content = resp.content
+            self.send_response(upstream.status)
+            self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(content)))
             self.end_headers()
             self.wfile.write(content)
@@ -225,24 +246,26 @@ class RAGProxyHandler(BaseHTTPRequestHandler):
             self.send_error(502, f"Backend error: {e}")
             return
 
-        # Send response
+        # Collect full response body (requests auto-decompresses gzip)
+        content = resp.content
+        resp.close()
+
+        # Send response headers
         self.send_response(resp.status_code)
-        skip_resp = {"transfer-encoding", "connection", "content-encoding"}
+        # Skip hop-by-hop and encoding headers (content is already decompressed)
+        skip_resp = {"transfer-encoding", "connection", "content-encoding", "content-length"}
         for k, v in resp.headers.items():
             if k.lower() not in skip_resp:
                 self.send_header(k, v)
+        self.send_header("Content-Length", str(len(content)))
         self.end_headers()
 
-        # Stream response body
+        # Write response body
         try:
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    self.wfile.write(chunk)
+            self.wfile.write(content)
             self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             pass
-        finally:
-            resp.close()
 
     def do_GET(self):
         self._forward_request("GET")
@@ -312,6 +335,8 @@ def main():
         def _handle(self, request, client_address):
             try:
                 self.finish_request(request, client_address)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                pass  # Client disconnected, don't spam the console
             except Exception:
                 self.handle_error(request, client_address)
             finally:
