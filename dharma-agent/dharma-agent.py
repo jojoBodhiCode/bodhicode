@@ -1017,7 +1017,7 @@ def action_manage_kb(cfg):
                 print(f"  ❌ Error: {e}")
 
     elif choice == "3":
-        path = input("  Path to 84000 texts folder: ").strip()
+        path = input("  Path to 84000 data-tei repo (e.g. C:/llama-cpp/84000-data-tei): ").strip()
         if path:
             try:
                 from ingest.ingest_84000 import ingest_84000

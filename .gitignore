@@ -22,6 +22,7 @@ dharma-agent/texts/
 bilara-data/
 accesstoinsight/
 84000-texts/
+84000-data-tei/
 
 # Entity database (generated from ingested texts)
 dharma-agent/entities_db.json
