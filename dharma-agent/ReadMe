@@ -1,0 +1,116 @@
+# 🪷 Dharma Scholar — Moltbook Agent
+
+A Buddhist scholar AI agent that runs locally using Ollama and posts to [Moltbook](https://www.moltbook.com), the social network for AI agents.
+
+**Workflow:** Draft & Approve — the agent generates content, you review and approve before anything gets posted.
+
+## Requirements
+
+- **Python 3.8+** (you likely already have this)
+- **Ollama** (free, local LLM runner)
+- **16 GB RAM** (runs on CPU — no GPU needed)
+
+## Setup
+
+### 1. Install Ollama
+
+Download from [ollama.com](https://ollama.com) and install it.
+
+Then open a terminal and pull the model:
+
+```bash
+ollama pull llama3.1:8b
+```
+
+This downloads ~4.7 GB. Once done, Ollama runs in the background automatically on Windows.
+
+### 2. Install Python dependency
+
+```bash
+pip install requests
+```
+
+### 3. Run the agent
+
+```bash
+python dharma_agent.py
+```
+
+On first run, it will walk you through:
+
+- Registering your agent on Moltbook
+- Claiming it with your X/Twitter account
+- Confirming your Ollama model
+
+### 4. Claim your agent
+
+After registration, the setup will give you a claim URL. Open it in your browser and follow the instructions to verify with your X account.
+
+## Usage
+
+The agent runs as an interactive menu:
+
+```
+  [1] Draft a new post              — Generate a Buddhist philosophy post
+  [2] Browse feed & draft comments  — Read posts and draft replies
+  [3] Search & engage               — Find relevant discussions
+  [4] Review pending drafts         — Approve, edit, or discard drafts
+  [5] Check feed                    — See what's happening on Moltbook
+  [6] View profile                  — Check your agent's stats
+  [7] Create dharma submolt         — Create a m/dharma community
+  [8] Settings                      — Change model, submolt, etc.
+```
+
+### Typical session
+
+1. Run the agent
+2. Press `1` to draft a post — the LLM generates a scholarly post (~30-60 sec)
+3. Press `4` to review it — read, approve, edit, or regenerate
+4. Press `2` to browse the feed and draft comments on other agents' posts
+5. Press `4` again to review and approve your comments
+
+Nothing gets posted without your explicit approval.
+
+## Configuration
+
+Config is stored at `~/.config/dharma-agent/config.json`:
+
+```json
+{
+  "moltbook_api_key": "moltbook_xxx",
+  "agent_name": "DharmaScholar",
+  "ollama_model": "llama3.1:8b",
+  "ollama_base_url": "http://localhost:11434",
+  "default_submolt": "general",
+  "dharma_submolt": "dharma"
+}
+```
+
+### Changing the model
+
+If you get more RAM or want to experiment:
+
+- `llama3.1:8b` — Default, good balance (needs ~8 GB RAM)
+- `qwen2.5:7b` — Alternative, sometimes better at structured output
+- `mistral` — Lighter option
+- `llama3.1:70b` — Much better quality if you ever get 64 GB+ RAM
+
+Change in settings (option 8) or edit the config file directly.
+
+## Files
+
+```
+~/.config/dharma-agent/
+├── config.json          # API key and settings
+├── activity.log         # Log of all actions taken
+└── drafts/              # Pending drafts awaiting review
+    ├── post_20250205_143022.json
+    └── comment_20250205_144511.json
+```
+
+## Tips
+
+- **Post quality:** The 8B model is decent but not perfect for nuanced philosophy. Use the edit option liberally — let the LLM give you a starting point, then refine.
+- **Engage genuinely:** The search feature helps find conversations where Buddhist perspectives would add value.
+- **Create m/dharma early:** Having your own submolt gives your posts a natural home and helps build a community.
+- **Post timing:** Moltbook has a 30-minute cooldown between posts, so quality over quantity.

@@ -1,0 +1,27 @@
+# llama.cpp binaries and archives
+llama-b7664-bin-win-cpu-x64/
+llama-b7664-bin-win-cpu-x64.zip
+
+# Model files (large, not for git)
+models/
+*.gguf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# RAG data (generated locally)
+dharma-agent/chroma_buddhist_db/
+dharma-agent/texts/
+
+# Config (contains API keys)
+# Users create their own via setup wizard
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
