@@ -201,7 +201,7 @@ channel_history = defaultdict(list)
 @client.event
 async def on_ready():
     print(f"\n  Discord bot logged in as {client.user}")
-    print(f"  Mention me with @{client.user.name} to ask a question.")
+    print(f"  DM me directly, or @mention me in a server.")
     print(f"  LLM backend: {get_llama_url()}")
     # Pre-load RAG
     get_rag()
@@ -214,21 +214,26 @@ async def on_message(message):
     if message.author == client.user:
         return
 
-    # Only respond when @mentioned
-    if client.user not in message.mentions:
+    # Respond in DMs (no mention needed) or when @mentioned in a server
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    is_mentioned = client.user in message.mentions
+
+    if not is_dm and not is_mentioned:
         return
 
     # Strip the mention from the message to get the actual question
     question = message.content
-    for mention in message.mentions:
-        question = question.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+    if not is_dm:
+        for mention in message.mentions:
+            question = question.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
     question = question.strip()
 
     if not question:
-        await message.reply("Ask me anything about Buddhism! Just @mention me with your question.")
+        await message.reply("Ask me anything about Buddhism!")
         return
 
-    print(f"  [Discord] #{message.channel.name} | {message.author}: {question[:80]}...")
+    channel_name = "DM" if is_dm else f"#{message.channel.name}"
+    print(f"  [Discord] {channel_name} | {message.author}: {question[:80]}...")
 
     # Show typing indicator while we generate
     async with message.channel.typing():
