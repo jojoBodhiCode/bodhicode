@@ -36,7 +36,7 @@ from prompts import SYSTEM_PROMPT, TEMPERATURE_FACTUAL
 
 CONFIG_FILE = Path.home() / ".config" / "dharma-agent" / "config.json"
 LLAMA_SERVER_URL = "http://127.0.0.1:8080"
-MAX_HISTORY = 4           # max messages per channel (keep small to fit 4096 context)
+MAX_HISTORY = 2           # max messages per channel (keep small to fit 4096 context)
 DISCORD_CHAR_LIMIT = 2000  # Discord message character limit
 
 
@@ -132,7 +132,7 @@ def generate_response(messages):
         "messages": messages,
         "temperature": TEMPERATURE_FACTUAL,
         "top_p": 0.9,
-        "max_tokens": 1024,
+        "max_tokens": 768,
         "stream": False,
     }).encode("utf-8")
 
@@ -281,12 +281,20 @@ async def on_message(message):
             None, generate_response, messages
         )
 
+        # If context overflow, retry with no history (just system + current question)
+        if response is None and len(history) > 1:
+            print("  [Discord] Retrying without conversation history...")
+            history[:] = [{"role": "user", "content": augmented_question}]
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+            response = await asyncio.get_event_loop().run_in_executor(
+                None, generate_response, messages
+            )
+
         if response is None:
             await message.reply(
-                "I'm having trouble connecting to my LLM backend. "
-                "Please make sure llama-server is running."
+                "I'm having trouble generating a response. "
+                "The question may be too long, or the backend may be down."
             )
-            # Remove the failed user message from history
             history.pop()
             return
 
