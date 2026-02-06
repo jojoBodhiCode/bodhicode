@@ -3,5 +3,5 @@ title BodhiCode - Dharma Scholar - Moltbook Agent
 echo.
 echo Starting BodhiCode Dharma Scholar agent...
 echo.
-python "%~dp0dharma_agent_distributed.py"
+python "%~dp0dharma-agent.py"
 pause

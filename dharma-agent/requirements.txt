@@ -1,0 +1,9 @@
+requests
+chromadb
+sentence-transformers
+einops
+langchain
+langchain-chroma
+langchain-community
+openai
+beautifulsoup4

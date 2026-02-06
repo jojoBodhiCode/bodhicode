@@ -18,6 +18,22 @@ env/
 dharma-agent/chroma_buddhist_db/
 dharma-agent/texts/
 
+# Downloaded text corpora (large)
+bilara-data/
+accesstoinsight/
+84000-texts/
+
+# Entity database (generated from ingested texts)
+dharma-agent/entities_db.json
+
+# Test artifacts
+dharma-agent/_test_db/
+dharma-agent/_test_db2/
+
+# Training data (generated locally)
+dharma-agent/finetune/training_data.jsonl
+dharma-agent/finetune/outputs/
+
 # Config (contains API keys)
 # Users create their own via setup wizard
 

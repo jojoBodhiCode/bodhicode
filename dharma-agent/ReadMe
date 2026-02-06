@@ -1,54 +1,61 @@
-# 🪷 Dharma Scholar — Moltbook Agent
+# Dharma Scholar — Moltbook Agent
 
-A Buddhist scholar AI agent that runs locally using Ollama and posts to [Moltbook](https://www.moltbook.com), the social network for AI agents.
+A Buddhist scholar AI agent that runs locally using Ollama or llama-server and posts to [Moltbook](https://www.moltbook.com), the social network for AI agents.
 
 **Workflow:** Draft & Approve — the agent generates content, you review and approve before anything gets posted.
 
+**Features:**
+- Structured scholarly system prompt with tradition-tagging and anti-hallucination rules
+- RAG pipeline grounded in canonical Buddhist texts (SuttaCentral, Access to Insight, 84000.co)
+- Post-generation verification against a known-entities database
+- Confidence scoring in the draft review workflow
+- Optional LoRA fine-tuning support via Google Colab
+
 ## Requirements
 
-- **Python 3.8+** (you likely already have this)
-- **Ollama** (free, local LLM runner)
-- **16 GB RAM** (runs on CPU — no GPU needed)
+- **Python 3.8+**
+- **16 GB RAM** (runs on CPU — no GPU needed for inference or RAG)
+- **Ollama** or **llama-server** (for LLM inference)
 
-## Setup
+## Quick Start
 
-### 1. Install Ollama
-
-Download from [ollama.com](https://ollama.com) and install it.
-
-Then open a terminal and pull the model:
+### 1. Install dependencies
 
 ```bash
+cd dharma-agent
+python -m venv .venv
+
+# Windows
+.venv\Scripts\activate
+# Linux/Mac
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+### 2. Set up inference backend
+
+**Option A: Ollama (simpler)**
+```bash
+# Install from https://ollama.com
 ollama pull llama3.1:8b
 ```
 
-This downloads ~4.7 GB. Once done, Ollama runs in the background automatically on Windows.
-
-### 2. Install Python dependency
-
+**Option B: llama-server (bigger models, distributed)**
 ```bash
-pip install requests
+# Use the pre-built llama-server.exe with a GGUF model
+llama-server -m ../models/Qwen2.5-14B-Instruct-Q4_K_M.gguf
 ```
 
 ### 3. Run the agent
 
 ```bash
-python dharma_agent.py
+python dharma-agent.py
 ```
 
-On first run, it will walk you through:
-
-- Registering your agent on Moltbook
-- Claiming it with your X/Twitter account
-- Confirming your Ollama model
-
-### 4. Claim your agent
-
-After registration, the setup will give you a claim URL. Open it in your browser and follow the instructions to verify with your X account.
+On first run, the setup wizard walks you through registering on Moltbook and choosing your backend.
 
 ## Usage
-
-The agent runs as an interactive menu:
 
 ```
   [1] Draft a new post              — Generate a Buddhist philosophy post
@@ -59,17 +66,97 @@ The agent runs as an interactive menu:
   [6] View profile                  — Check your agent's stats
   [7] Create dharma submolt         — Create a m/dharma community
   [8] Settings                      — Change model, submolt, etc.
+  [9] Manage knowledge base (RAG)   — Ingest texts, search, manage
+  [q] Quit
 ```
 
-### Typical session
+## RAG Knowledge Base
 
-1. Run the agent
-2. Press `1` to draft a post — the LLM generates a scholarly post (~30-60 sec)
-3. Press `4` to review it — read, approve, edit, or regenerate
-4. Press `2` to browse the feed and draft comments on other agents' posts
-5. Press `4` again to review and approve your comments
+The agent uses Retrieval-Augmented Generation to ground responses in actual canonical Buddhist texts. This dramatically improves citation accuracy.
 
-Nothing gets posted without your explicit approval.
+### Ingesting texts
+
+Use menu option **[9] Manage knowledge base** to ingest from these sources:
+
+**SuttaCentral (Theravada — Pali Canon)**
+```bash
+git clone https://github.com/suttacentral/bilara-data.git
+# Then use option [9] → [1] and point to the bilara-data directory
+```
+- Thousands of suttas in structured JSON, segmented by sentence
+- Bhikkhu Sujato's translations (CC0 public domain)
+- Covers all five Nikayas, Vinaya, and Abhidhamma
+
+**Access to Insight (Theravada)**
+- Download from: https://www.accesstoinsight.org/lib/downloads/ati_website.zip
+- Extract and use option [9] → [2]
+- 1,000+ curated sutta translations (Thanissaro Bhikkhu, Bhikkhu Bodhi, etc.)
+
+**84000.co (Mahayana/Vajrayana — Tibetan Canon)**
+- Download texts from: https://84000.co/all-translations
+- Use option [9] → [3]
+- English translations of the Kangyur and Tengyur (CC BY-NC)
+
+### How RAG works
+
+When drafting posts or comments, the agent:
+1. Embeds the topic using `nomic-ai/nomic-embed-text-v1.5` (runs on CPU)
+2. Retrieves the top-5 most relevant chunks from ChromaDB
+3. Injects the retrieved context into the prompt with source citations
+4. The LLM generates a response grounded in actual canonical text
+5. Sources are stored in the draft metadata for review
+
+### Embedding model
+
+- **nomic-embed-text-v1.5**: 8,192-token context, ~274MB, Apache 2.0
+- Runs entirely on CPU via `sentence-transformers`
+- First run downloads the model; subsequent runs use cache
+
+## Guardrails
+
+The agent has multiple layers of defense against fabrication:
+
+### 1. System prompt constraints
+- Mandatory tradition-tagging (Theravada/Mahayana/Vajrayana)
+- Anti-hallucination rules: no fabricated quotes, mandatory uncertainty acknowledgment
+- Chain-of-thought reasoning instruction
+
+### 2. RAG grounding
+- Responses cite actual canonical sources
+- Sources shown during draft review
+
+### 3. Post-generation verification
+- Extracts entity mentions (text names, teacher names, schools)
+- Checks each against a database of 300+ verified Buddhist entities
+- Flags unrecognized entities as potential fabrications
+- Warns about direct quotes, specific verse numbers, and the pejorative "Hinayana"
+
+### 4. Confidence scoring
+- Each draft shows a confidence score during review
+- Verified entities show green, unverified show yellow
+- Specific warnings for high-risk patterns
+
+## Fine-Tuning (Optional)
+
+For polishing the agent's tone and style (not for factual accuracy — that's RAG's job):
+
+### 1. Prepare training data
+```bash
+cd finetune
+python prepare_training_data.py --output training_data.jsonl --generate
+```
+This exports approved drafts and generates additional Q&A pairs.
+
+### 2. Fine-tune on Google Colab
+- Upload `training_data.jsonl` to Colab
+- Open `finetune/buddhist_scholar_qlora.ipynb`
+- Run all cells (uses free T4 GPU, takes 2-4 hours)
+- Download the GGUF adapter
+
+### 3. Deploy locally
+```bash
+llama-server -m Qwen2.5-14B-Instruct-Q4_K_M.gguf --lora buddhist-scholar.gguf
+```
 
 ## Configuration
 
@@ -79,38 +166,42 @@ Config is stored at `~/.config/dharma-agent/config.json`:
 {
   "moltbook_api_key": "moltbook_xxx",
   "agent_name": "DharmaScholar",
+  "backend": "llama-server",
   "ollama_model": "llama3.1:8b",
   "ollama_base_url": "http://localhost:11434",
+  "llama_server_url": "http://127.0.0.1:8080",
   "default_submolt": "general",
   "dharma_submolt": "dharma"
 }
 ```
 
-### Changing the model
-
-If you get more RAM or want to experiment:
-
-- `llama3.1:8b` — Default, good balance (needs ~8 GB RAM)
-- `qwen2.5:7b` — Alternative, sometimes better at structured output
-- `mistral` — Lighter option
-- `llama3.1:70b` — Much better quality if you ever get 64 GB+ RAM
-
-Change in settings (option 8) or edit the config file directly.
-
-## Files
+## Project Structure
 
 ```
-~/.config/dharma-agent/
-├── config.json          # API key and settings
-├── activity.log         # Log of all actions taken
-└── drafts/              # Pending drafts awaiting review
-    ├── post_20250205_143022.json
-    └── comment_20250205_144511.json
+dharma-agent/
+├── dharma-agent.py          # Main agent application
+├── prompts.py               # System prompt and temperature presets
+├── rag.py                   # RAG pipeline (embeddings + ChromaDB)
+├── entities.py              # Known-entities database for verification
+├── verify.py                # Post-generation verification
+├── requirements.txt         # Python dependencies
+├── run.bat                  # Windows launcher
+├── ReadMe                   # This file
+├── ingest/                  # Text ingestion scripts
+│   ├── __init__.py
+│   ├── ingest_common.py     # Shared chunking logic
+│   ├── ingest_suttacentral.py
+│   ├── ingest_accesstoinsight.py
+│   └── ingest_84000.py
+└── finetune/                # LoRA fine-tuning support
+    ├── prepare_training_data.py
+    └── buddhist_scholar_qlora.ipynb
 ```
 
 ## Tips
 
-- **Post quality:** The 8B model is decent but not perfect for nuanced philosophy. Use the edit option liberally — let the LLM give you a starting point, then refine.
-- **Engage genuinely:** The search feature helps find conversations where Buddhist perspectives would add value.
-- **Create m/dharma early:** Having your own submolt gives your posts a natural home and helps build a community.
+- **Ingest SuttaCentral first** — it's the easiest source (structured JSON, CC0 license) and covers Theravada comprehensively.
+- **Post quality improves dramatically with RAG** — even a few hundred indexed suttas make a visible difference.
+- **Use the verification during review** — if entities show as unverified, consider editing the draft.
 - **Post timing:** Moltbook has a 30-minute cooldown between posts, so quality over quantity.
+- **Create m/dharma early** — having your own submolt gives your posts a natural home.

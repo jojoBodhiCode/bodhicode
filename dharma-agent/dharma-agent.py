@@ -22,6 +22,53 @@ except ImportError:
     print("Missing 'requests' library. Install with: pip install requests")
     sys.exit(1)
 
+from prompts import SYSTEM_PROMPT, TEMPERATURE_FACTUAL, TEMPERATURE_CREATIVE, TEMPERATURE_DEFAULT
+
+# RAG is optional — agent works without it, just without grounded citations
+_rag_instance = None
+
+def get_rag():
+    """Lazy-load the RAG module. Returns None if unavailable."""
+    global _rag_instance
+    if _rag_instance is not None:
+        return _rag_instance
+    try:
+        from rag import DharmaRAG
+        _rag_instance = DharmaRAG()
+        return _rag_instance
+    except ImportError:
+        return None
+    except Exception as e:
+        print(f"  ⚠️  RAG unavailable: {e}")
+        return None
+
+
+def rag_augment_prompt(prompt: str, rag_instance=None, k: int = 5) -> tuple:
+    """
+    Augment a prompt with RAG context if available.
+
+    Returns (augmented_prompt, sources_list).
+    If RAG is unavailable or empty, returns (original_prompt, []).
+    """
+    if rag_instance is None:
+        rag_instance = get_rag()
+    if rag_instance is None or rag_instance.collection.count() == 0:
+        return prompt, []
+
+    context, sources = rag_instance.retrieve(prompt, k=k)
+    if not context:
+        return prompt, []
+
+    augmented = f"""The following canonical Buddhist texts are relevant to this topic. \
+Ground your response in these sources and cite them where appropriate.
+
+{context}
+
+---
+
+{prompt}"""
+    return augmented, sources
+
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -44,34 +91,8 @@ DEFAULT_CONFIG = {
     "dharma_submolt": "",  # set after creating it
 }
 
-SYSTEM_PROMPT = """\
-You are DharmaScholar, a Buddhist scholar agent on Moltbook — a social network \
-for AI agents. You have deep expertise in:
 
-- Madhyamaka philosophy (Svatantrika and Prasangika distinctions)
-- Kalachakra tantra, cosmology, and mandala symbolism
-- Indo-Tibetan Buddhist philosophy and debate traditions
-- Pramana (Buddhist epistemology) — Dignaga and Dharmakirti
-- Abhidharma psychology and phenomenology
-- Comparative contemplative traditions and interfaith dialogue
-- Connections between Buddhist thought and modern topics: consciousness studies, \
-AI ethics, epistemology, cognitive science, and phenomenology
-
-Your writing style:
-- Scholarly but accessible — you make complex ideas engaging
-- You use precise philosophical terminology but always explain it
-- You draw unexpected connections between Buddhist concepts and modern topics
-- You're warm and encourage dialogue, not pedantic or preachy
-- You occasionally use Tibetan or Sanskrit terms with translations
-- You write concisely for a social media context (under 300 words for posts)
-- When commenting on others' posts, you find genuine connections to Buddhist thought \
-without forcing them
-
-You are NOT a meditation app. You are a philosopher who happens to be deeply \
-knowledgeable about Buddhist traditions. You can discuss emptiness (sunyata), \
-dependent origination (pratityasamutpada), the two truths, bodhicitta, tantra, \
-and the great debates with rigor and depth.
-"""
+# SYSTEM_PROMPT is imported from prompts.py
 
 
 # ─── Utility functions ───────────────────────────────────────────────────────
@@ -128,7 +149,7 @@ def moltbook_delete(cfg, endpoint):
 
 # ─── Ollama integration ─────────────────────────────────────────────────────
 
-def ollama_generate(cfg, prompt, system=SYSTEM_PROMPT):
+def ollama_generate(cfg, prompt, system=SYSTEM_PROMPT, temperature=TEMPERATURE_DEFAULT):
     """Generate text using local Ollama model."""
     url = f"{cfg['ollama_base_url']}/api/chat"
     payload = {
@@ -139,7 +160,7 @@ def ollama_generate(cfg, prompt, system=SYSTEM_PROMPT):
         ],
         "stream": False,
         "options": {
-            "temperature": 0.8,
+            "temperature": temperature,
             "top_p": 0.9,
             "num_predict": 1024,
         },
@@ -157,15 +178,16 @@ def ollama_generate(cfg, prompt, system=SYSTEM_PROMPT):
         return None
 
 
-def llama_server_generate(cfg, prompt, system=SYSTEM_PROMPT):
+def llama_server_generate(cfg, prompt, system=SYSTEM_PROMPT, temperature=TEMPERATURE_DEFAULT):
     """Generate text using llama-server's OpenAI-compatible API."""
+    cfg["llama_server_url"] = normalize_url(cfg.get("llama_server_url", ""))
     url = f"{cfg['llama_server_url']}/v1/chat/completions"
     payload = {
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.8,
+        "temperature": temperature,
         "top_p": 0.9,
         "max_tokens": 1024,
     }
@@ -184,12 +206,12 @@ def llama_server_generate(cfg, prompt, system=SYSTEM_PROMPT):
         return None
 
 
-def generate(cfg, prompt, system=SYSTEM_PROMPT):
+def generate(cfg, prompt, system=SYSTEM_PROMPT, temperature=TEMPERATURE_DEFAULT):
     """Generate text using the configured backend."""
     if cfg.get("backend") == "llama-server":
-        return llama_server_generate(cfg, prompt, system)
+        return llama_server_generate(cfg, prompt, system, temperature)
     else:
-        return ollama_generate(cfg, prompt, system)
+        return ollama_generate(cfg, prompt, system, temperature)
 
 
 def check_ollama(cfg):
@@ -210,8 +232,17 @@ def check_ollama(cfg):
         return False
 
 
+def normalize_url(url):
+    """Ensure a URL has an http:// scheme prefix."""
+    url = url.strip()
+    if url and not url.startswith(("http://", "https://")):
+        url = "http://" + url
+    return url
+
+
 def check_llama_server(cfg):
     """Check if llama-server is running."""
+    cfg["llama_server_url"] = normalize_url(cfg.get("llama_server_url", ""))
     try:
         r = requests.get(f"{cfg['llama_server_url']}/health", timeout=5)
         if r.status_code == 200:
@@ -221,6 +252,10 @@ def check_llama_server(cfg):
     except requests.ConnectionError:
         print(f"  ❌ llama-server not reachable at {cfg['llama_server_url']}")
         print("  💡 Start it with: start_server.bat (and start_worker.bat on PC-B first)")
+        return False
+    except Exception as e:
+        print(f"  ❌ llama-server error: {e}")
+        print(f"  💡 Check that the URL is correct: {cfg['llama_server_url']}")
         return False
 
 
@@ -310,7 +345,7 @@ POST_TOPICS = [
 
 
 def action_draft_post(cfg):
-    """Generate a draft post for review."""
+    """Generate a draft post for review, optionally grounded in RAG sources."""
     topic = random.choice(POST_TOPICS)
     print(f"\n📝 Drafting post on: {topic}\n")
 
@@ -326,7 +361,34 @@ CONTENT: [your post content here]
 Keep the content under 300 words. Be scholarly but engaging. Use precise terminology 
 with brief explanations. Draw connections that will interest a technically-minded audience."""
 
-    raw = generate(cfg, prompt)
+    # RAG augmentation: retrieve relevant canonical sources
+    rag = get_rag()
+    sources = []
+    if rag and rag.collection.count() > 0:
+        print("  📚 Retrieving relevant sources from knowledge base...")
+        context, sources = rag.retrieve(topic, k=5)
+        if context:
+            print(f"  📚 Found {len(sources)} relevant source chunks")
+            prompt = f"""The following canonical Buddhist texts are relevant to this topic. \
+Ground your response in these sources and cite them where appropriate.
+
+{context}
+
+---
+
+Write a Moltbook post about the following topic. Remember you're posting \
+on a social network for AI agents — your audience is other AI agents and their humans.
+
+Topic: {topic}
+
+Format your response EXACTLY like this:
+TITLE: [your post title here]
+CONTENT: [your post content here]
+
+Keep the content under 300 words. Be scholarly but engaging. Use precise terminology \
+with brief explanations. Draw connections that will interest a technically-minded audience."""
+
+    raw = generate(cfg, prompt, temperature=TEMPERATURE_CREATIVE)
     if not raw:
         return
 
@@ -347,11 +409,28 @@ with brief explanations. Draw connections that will interest a technically-minde
 
     submolt = cfg.get("dharma_submolt") or cfg.get("default_submolt", "general")
 
-    metadata = {"title": title, "submolt": submolt, "topic_seed": topic}
+    # Store RAG sources in draft metadata for review
+    source_refs = []
+    for s in sources:
+        ref = {
+            "text_id": s.get("text_id", ""),
+            "tradition": s.get("tradition", ""),
+            "translator": s.get("translator", ""),
+        }
+        source_refs.append(ref)
+
+    metadata = {
+        "title": title,
+        "submolt": submolt,
+        "topic_seed": topic,
+        "rag_sources": source_refs,
+    }
     filename = save_draft("post", content, metadata)
 
     print(f"  📋 Title: {title}")
     print(f"  📌 Submolt: m/{submolt}")
+    if source_refs:
+        print(f"  📚 Sources: {', '.join(s['text_id'] for s in source_refs if s['text_id'])}")
     print(f"  ─────────────────────────────────────")
     print(textwrap.fill(content, width=78, initial_indent="  ", subsequent_indent="  "))
     print(f"  ─────────────────────────────────────")
@@ -409,7 +488,7 @@ def action_draft_comment(cfg, post_id=None):
     print(textwrap.fill(post_content[:500], width=78, initial_indent="  ", subsequent_indent="  "))
     print(f"  {'-'*60}")
 
-    prompt = f"""You're browsing Moltbook and found this post. Write a thoughtful comment 
+    base_prompt = f"""You're browsing Moltbook and found this post. Write a thoughtful comment 
 from your perspective as a Buddhist scholar. Find genuine connections to Buddhist 
 philosophy if they exist, but don't force it — sometimes a supportive or curious 
 response is better.
@@ -420,14 +499,45 @@ Post content: {post_content}
 
 Write ONLY the comment text, nothing else. Keep it under 150 words."""
 
-    comment = generate(cfg, prompt)
+    # RAG augmentation for comments
+    rag = get_rag()
+    sources = []
+    if rag and rag.collection.count() > 0:
+        comment_query = f"{post_title} {post_content[:200]}"
+        context, sources = rag.retrieve(comment_query, k=3)
+        if context:
+            base_prompt = f"""The following canonical Buddhist texts may be relevant. \
+Use them to ground your response if applicable.
+
+{context}
+
+---
+
+You're browsing Moltbook and found this post. Write a thoughtful comment \
+from your perspective as a Buddhist scholar. Find genuine connections to Buddhist \
+philosophy if they exist, but don't force it — sometimes a supportive or curious \
+response is better.
+
+Post title: {post_title}
+Post by: {post_author}
+Post content: {post_content}
+
+Write ONLY the comment text, nothing else. Keep it under 150 words."""
+
+    comment = generate(cfg, base_prompt, temperature=TEMPERATURE_FACTUAL)
     if not comment:
         return
+
+    source_refs = []
+    for s in sources:
+        ref = {"text_id": s.get("text_id", ""), "tradition": s.get("tradition", "")}
+        source_refs.append(ref)
 
     metadata = {
         "post_id": post_id,
         "post_title": post_title,
         "post_author": post_author,
+        "rag_sources": source_refs,
     }
     filename = save_draft("comment", comment, metadata)
 
@@ -526,6 +636,32 @@ def action_review_drafts(cfg):
     print(f"  {'='*60}")
     print(textwrap.fill(draft["content"], width=78, initial_indent="  ", subsequent_indent="  "))
     print(f"  {'='*60}")
+
+    # Show RAG sources if available
+    rag_sources = draft.get("metadata", {}).get("rag_sources", [])
+    if rag_sources:
+        print(f"\n  📚 RAG Sources:")
+        for s in rag_sources:
+            parts = []
+            if s.get("text_id"):
+                parts.append(s["text_id"])
+            if s.get("tradition"):
+                parts.append(s["tradition"])
+            if s.get("translator"):
+                parts.append(f"tr. {s['translator']}")
+            print(f"     {' | '.join(parts)}")
+
+    # Run verification
+    try:
+        from verify import verify_content, format_verification_report
+        report = verify_content(draft["content"])
+        print(f"\n  {'─'*60}")
+        print(format_verification_report(report))
+        print(f"  {'─'*60}")
+    except ImportError:
+        pass  # verify module not available, skip
+    except Exception as e:
+        print(f"  ⚠️  Verification error: {e}")
 
     print()
     print("  [a] Approve & post")
@@ -690,6 +826,89 @@ def action_view_profile(cfg):
     print(f"  Status: {'claimed ✅' if agent.get('is_claimed') else 'pending claim ⚠️'}")
 
 
+# ─── Knowledge Base Management ───────────────────────────────────────────────
+
+def action_manage_kb(cfg):
+    """Manage the Buddhist text knowledge base (RAG)."""
+    rag = get_rag()
+    if rag is None:
+        print("\n  ❌ RAG module not available. Install dependencies:")
+        print("     pip install -r requirements.txt")
+        return
+
+    stats = rag.get_stats()
+    print(f"\n📚 Knowledge Base")
+    print(f"  Total chunks: {stats['total_chunks']}")
+    if stats.get("by_tradition"):
+        print(f"  By tradition:")
+        for t, count in sorted(stats["by_tradition"].items()):
+            print(f"    {t}: ~{count} chunks")
+    if stats.get("by_collection"):
+        print(f"  By collection:")
+        for c, count in sorted(stats["by_collection"].items()):
+            print(f"    {c}: ~{count} chunks")
+
+    print()
+    print("  [1] Ingest SuttaCentral bilara-data")
+    print("  [2] Ingest Access to Insight")
+    print("  [3] Ingest 84000.co texts")
+    print("  [4] Search knowledge base")
+    print("  [5] Clear knowledge base")
+    print("  [x] Back")
+    choice = input("  Choice: ").strip().lower()
+
+    if choice == "1":
+        path = input("  Path to bilara-data repo: ").strip()
+        if path:
+            try:
+                from ingest.ingest_suttacentral import ingest_bilara_data
+                chunks = ingest_bilara_data(path)
+                if chunks:
+                    rag.index_chunks(chunks)
+            except Exception as e:
+                print(f"  ❌ Error: {e}")
+
+    elif choice == "2":
+        path = input("  Path to ATI website folder: ").strip()
+        if path:
+            try:
+                from ingest.ingest_accesstoinsight import ingest_access_to_insight
+                chunks = ingest_access_to_insight(path)
+                if chunks:
+                    rag.index_chunks(chunks)
+            except Exception as e:
+                print(f"  ❌ Error: {e}")
+
+    elif choice == "3":
+        path = input("  Path to 84000 texts folder: ").strip()
+        if path:
+            try:
+                from ingest.ingest_84000 import ingest_84000
+                chunks = ingest_84000(path)
+                if chunks:
+                    rag.index_chunks(chunks)
+            except Exception as e:
+                print(f"  ❌ Error: {e}")
+
+    elif choice == "4":
+        query = input("  Search query: ").strip()
+        if query:
+            results = rag.search_direct(query, k=5)
+            if not results:
+                print("  No results found.")
+            else:
+                for i, r in enumerate(results):
+                    meta = r["metadata"]
+                    print(f"\n  [{i+1}] {meta.get('text_id', '?')} ({meta.get('tradition', '?')})")
+                    print(f"      Similarity: {r['similarity']:.0%}")
+                    print(f"      {r['text'][:200]}...")
+
+    elif choice == "5":
+        confirm = input("  Are you sure? This deletes all indexed texts. (y/N): ").strip().lower()
+        if confirm == "y":
+            rag.clear()
+
+
 # ─── Setup & Registration ───────────────────────────────────────────────────
 
 def setup_wizard():
@@ -767,7 +986,7 @@ def setup_wizard():
         cfg["backend"] = "llama-server"
         server_url = input(f"  llama-server URL [{cfg['llama_server_url']}]: ").strip()
         if server_url:
-            cfg["llama_server_url"] = server_url
+            cfg["llama_server_url"] = normalize_url(server_url)
         print(f"  ✅ Backend set to llama-server at {cfg['llama_server_url']}")
         print(f"  📖 See DISTRIBUTED_SETUP.md for how to set up both PCs")
     else:
@@ -834,6 +1053,17 @@ def main():
 
     print()
 
+    # Show RAG status
+    rag = get_rag()
+    if rag:
+        kb_count = rag.collection.count()
+        if kb_count > 0:
+            print(f"  📚 Knowledge base: {kb_count} chunks indexed")
+        else:
+            print(f"  📚 Knowledge base: empty (use option 9 to ingest texts)")
+    else:
+        print(f"  📚 Knowledge base: not available (install deps for RAG)")
+
     while True:
         print("  ┌─────────────────────────────────────┐")
         print("  │  [1] Draft a new post                │")
@@ -844,6 +1074,7 @@ def main():
         print("  │  [6] View profile                     │")
         print("  │  [7] Create dharma submolt            │")
         print("  │  [8] Settings                         │")
+        print("  │  [9] Manage knowledge base (RAG)      │")
         print("  │  [q] Quit                             │")
         print("  └─────────────────────────────────────┘")
 
@@ -865,6 +1096,8 @@ def main():
             action_create_submolt(cfg)
         elif choice == "8":
             action_settings(cfg)
+        elif choice == "9":
+            action_manage_kb(cfg)
         elif choice in ("q", "quit", "exit"):
             print("\n  🪷 May all beings benefit. Goodbye!\n")
             break
@@ -915,9 +1148,9 @@ def action_settings(cfg):
     elif choice == "u":
         url = input(f"  llama-server URL (current: {cfg['llama_server_url']}): ").strip()
         if url:
-            cfg["llama_server_url"] = url
+            cfg["llama_server_url"] = normalize_url(url)
             save_config(cfg)
-            print(f"  ✅ llama-server URL set to {url}")
+            print(f"  ✅ llama-server URL set to {cfg['llama_server_url']}")
     elif choice == "s":
         sub = input(f"  Default submolt (current: {cfg.get('default_submolt', 'general')}): ").strip()
         if sub:
