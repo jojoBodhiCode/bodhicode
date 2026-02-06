@@ -2,7 +2,7 @@
 RAG (Retrieval-Augmented Generation) module for the Dharma Scholar agent.
 
 Architecture:
-  - Embedding model: nomic-ai/nomic-embed-text-v1.5 (CPU, 8192 token context)
+  - Embedding model: nomic-ai/nomic-embed-text-v1.5 (CUDA if available, 8192 token context)
   - Vector store: ChromaDB (local persistent)
   - Integration: feeds retrieved context into llama-server via OpenAI-compatible API
 
@@ -17,6 +17,8 @@ import os
 import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+import torch
 
 try:
     import chromadb
@@ -39,7 +41,8 @@ from ingest.ingest_common import TextChunk
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "chroma_buddhist_db")
 DEFAULT_COLLECTION = "buddhist_texts"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
-BATCH_SIZE = 100  # Chunks per embedding batch (for memory management on CPU)
+_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 500 if _DEVICE == "cuda" else 100
 
 
 class DharmaRAG:
@@ -73,9 +76,8 @@ class DharmaRAG:
                 self._embedding_model_name,
                 trust_remote_code=True,
             )
-            # Set to CPU explicitly
-            self._embedder = self._embedder.to("cpu")
-            print(f"  Embedding model loaded.")
+            self._embedder = self._embedder.to(_DEVICE)
+            print(f"  Embedding model loaded on {_DEVICE.upper()}.")
         return self._embedder
 
     def _embed_texts(self, texts: List[str], prefix: str = "search_document: ") -> List[List[float]]:
