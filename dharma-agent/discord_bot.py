@@ -36,7 +36,7 @@ from prompts import SYSTEM_PROMPT, TEMPERATURE_FACTUAL
 
 CONFIG_FILE = Path.home() / ".config" / "dharma-agent" / "config.json"
 LLAMA_SERVER_URL = "http://127.0.0.1:8080"
-MAX_HISTORY = 20          # max messages per channel to keep in memory
+MAX_HISTORY = 4           # max messages per channel (keep small to fit 4096 context)
 DISCORD_CHAR_LIMIT = 2000  # Discord message character limit
 
 
@@ -104,7 +104,7 @@ def rag_retrieve(query):
     if rag is None or rag.collection.count() == 0:
         return "", []
     try:
-        context, sources = rag.retrieve(query, k=5)
+        context, sources = rag.retrieve(query, k=3)
         return context, sources
     except Exception as e:
         print(f"  [RAG] Retrieval error: {e}")
@@ -147,8 +147,18 @@ def generate_response(messages):
             },
         )
         resp = conn.getresponse()
-        data = json.loads(resp.read())
+        raw = resp.read()
         conn.close()
+        data = json.loads(raw)
+
+        if "choices" not in data:
+            # llama-server returned an error (likely context overflow)
+            error_msg = data.get("error", {})
+            if isinstance(error_msg, dict):
+                error_msg = error_msg.get("message", str(data))
+            print(f"  [LLM] Server error: {error_msg}")
+            return None
+
         return data["choices"][0]["message"]["content"]
     except Exception as e:
         print(f"  [LLM] Generation error: {e}")
