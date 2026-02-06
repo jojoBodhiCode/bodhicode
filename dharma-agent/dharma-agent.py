@@ -214,6 +214,66 @@ def generate(cfg, prompt, system=SYSTEM_PROMPT, temperature=TEMPERATURE_DEFAULT)
         return ollama_generate(cfg, prompt, system, temperature)
 
 
+def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT):
+    """Generate a response from a full messages list (multi-turn conversation).
+
+    Args:
+        cfg: Config dict with backend settings.
+        messages: List of {"role": ..., "content": ...} dicts.
+                  Should include the system message as the first entry.
+        temperature: Sampling temperature.
+
+    Returns:
+        The assistant's response text, or None on error.
+    """
+    if cfg.get("backend") == "llama-server":
+        cfg["llama_server_url"] = normalize_url(cfg.get("llama_server_url", ""))
+        url = f"{cfg['llama_server_url']}/v1/chat/completions"
+        payload = {
+            "messages": messages,
+            "temperature": temperature,
+            "top_p": 0.9,
+            "max_tokens": 1024,
+        }
+        try:
+            print(f"  ⏳ Thinking...")
+            r = requests.post(url, json=payload,
+                              headers={"Content-Type": "application/json"}, timeout=600)
+            r.raise_for_status()
+            data = r.json()
+            return data["choices"][0]["message"]["content"]
+        except requests.ConnectionError:
+            print(f"  ❌ Can't reach llama-server at {cfg['llama_server_url']}")
+            return None
+        except Exception as e:
+            print(f"  ❌ llama-server error: {e}")
+            return None
+    else:
+        # Ollama path
+        url = f"{cfg['ollama_base_url']}/api/chat"
+        payload = {
+            "model": cfg["ollama_model"],
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "top_p": 0.9,
+                "num_predict": 1024,
+            },
+        }
+        try:
+            print(f"  ⏳ Thinking...")
+            r = requests.post(url, json=payload, timeout=300)
+            r.raise_for_status()
+            return r.json()["message"]["content"]
+        except requests.ConnectionError:
+            print("  ❌ Can't reach Ollama. Is it running?")
+            return None
+        except Exception as e:
+            print(f"  ❌ Ollama error: {e}")
+            return None
+
+
 def check_ollama(cfg):
     """Check if Ollama is running and model is available."""
     try:
@@ -826,6 +886,83 @@ def action_view_profile(cfg):
     print(f"  Status: {'claimed ✅' if agent.get('is_claimed') else 'pending claim ⚠️'}")
 
 
+# ─── Interactive Chat ─────────────────────────────────────────────────────────
+
+MAX_CHAT_HISTORY = 20  # max messages (user+assistant) to keep in context
+
+def action_chat(cfg):
+    """Interactive chat with the RAG-augmented Dharma Scholar."""
+    print("\n  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║       🪷  Dharma Scholar — Interactive Chat  🪷        ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+
+    rag = get_rag()
+    has_kb = rag is not None and rag.collection.count() > 0
+    if has_kb:
+        count = rag.collection.count()
+        print(f"\n  📚 Knowledge base active ({count} chunks)")
+        print("  Answers will be grounded in canonical Buddhist texts.")
+    else:
+        print("\n  ⚠️  Knowledge base is empty — answers will not be grounded in sources.")
+        print("  Use option [9] from the main menu to ingest texts first.")
+
+    print("\n  Type your question and press Enter. Type 'q' to return to the main menu.\n")
+
+    # Conversation history starts with the system prompt
+    conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    while True:
+        try:
+            question = input("  You: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            break
+
+        if not question:
+            continue
+        if question.lower() in ("q", "quit", "exit"):
+            break
+
+        # Retrieve RAG context for this specific question
+        augmented_question, sources = rag_augment_prompt(question, rag)
+
+        # Add the (possibly augmented) user message to history
+        conversation.append({"role": "user", "content": augmented_question})
+
+        # Trim history if it gets too long (keep system + last N messages)
+        if len(conversation) > MAX_CHAT_HISTORY + 1:  # +1 for system message
+            conversation = [conversation[0]] + conversation[-(MAX_CHAT_HISTORY):]
+
+        # Generate
+        response = generate_chat(cfg, conversation, temperature=TEMPERATURE_FACTUAL)
+
+        if response is None:
+            print("  ❌ Failed to generate a response. Check your backend.\n")
+            # Remove the failed user message so conversation stays clean
+            conversation.pop()
+            continue
+
+        # Add assistant response to history
+        conversation.append({"role": "assistant", "content": response})
+
+        # Display response
+        print()
+        print(textwrap.indent(response, "  "))
+        print()
+
+        # Show sources if any
+        if sources:
+            source_ids = []
+            for s in sources:
+                sid = s.get("text_id", s.get("source", "unknown"))
+                if sid not in source_ids:
+                    source_ids.append(sid)
+            print(f"  📖 Sources: {', '.join(source_ids)}")
+            print()
+
+    print("  Returning to main menu.\n")
+
+
 # ─── Knowledge Base Management ───────────────────────────────────────────────
 
 def action_manage_kb(cfg):
@@ -1075,6 +1212,7 @@ def main():
         print("  │  [7] Create dharma submolt            │")
         print("  │  [8] Settings                         │")
         print("  │  [9] Manage knowledge base (RAG)      │")
+        print("  │  [c] Chat with Dharma Scholar         │")
         print("  │  [q] Quit                             │")
         print("  └─────────────────────────────────────┘")
 
@@ -1098,6 +1236,8 @@ def main():
             action_settings(cfg)
         elif choice == "9":
             action_manage_kb(cfg)
+        elif choice == "c":
+            action_chat(cfg)
         elif choice in ("q", "quit", "exit"):
             print("\n  🪷 May all beings benefit. Goodbye!\n")
             break
