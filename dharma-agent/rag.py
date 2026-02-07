@@ -44,7 +44,7 @@ EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 if torch.cuda.is_available():
     _DEVICE = "cuda:0"
     BATCH_SIZE = 32
-    _ENCODE_BATCH = 16  # small encode batches for 2GB VRAM
+    _ENCODE_BATCH = 8  # very small encode batches for 2GB VRAM
 else:
     _DEVICE = "cpu"
     BATCH_SIZE = 100
@@ -148,11 +148,17 @@ class DharmaRAG:
                 )
                 indexed += len(batch)
 
+                # Clear CUDA cache to prevent fragmentation on small VRAM GPUs
+                if _DEVICE.startswith("cuda"):
+                    torch.cuda.empty_cache()
+
                 if show_progress:
                     print(f"  Indexed {indexed}/{total} chunks", end="\r")
 
             except Exception as e:
                 print(f"\n  Warning: Error indexing batch at {batch_start}: {e}")
+                if _DEVICE.startswith("cuda"):
+                    torch.cuda.empty_cache()
                 continue
 
         if show_progress:
