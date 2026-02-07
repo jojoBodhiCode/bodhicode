@@ -86,29 +86,42 @@ COLLECTION_MAP = {
 }
 
 
-# ─── Tibetan script detection ────────────────────────────────────────────────
+# ─── CSS classes used by Lotsawa House ────────────────────────────────────────
+# Tibetan script classes (skip these)
+TIBETAN_CLASSES = {
+    "TibetanVerse", "HeadingTib", "TibetanInlineEnglish",
+    "TibetanProse", "TibetanTitle",
+}
 
-def is_tibetan_text(element) -> bool:
-    """Detect whether a BeautifulSoup element contains primarily Tibetan script."""
-    # Check inline style for Tibetan fonts
-    style = element.get("style", "") or ""
-    if "DDCUchen" in style or "Jomolhari" in style or "TibetanMachineUni" in style:
+# English content classes (keep these)
+ENGLISH_CLASSES = {
+    "EnglishText", "EnglishPhonetics", "Heading3", "Heading2",
+    "ExplanationBold", "Explanation", "Colophon",
+}
+
+
+def is_tibetan_element(element) -> bool:
+    """Check if a BeautifulSoup element is Tibetan script by CSS class or content."""
+    classes = element.get("class", [])
+    if any(c in TIBETAN_CLASSES for c in classes):
         return True
 
-    # Check lang attribute
-    lang = element.get("lang", "") or ""
-    if lang.startswith("bo"):
-        return True
+    # Check if the element is dominated by TibetanInlineEnglish spans
+    tibetan_spans = element.find_all("span", class_="TibetanInlineEnglish")
+    if tibetan_spans:
+        tibetan_len = sum(len(s.get_text()) for s in tibetan_spans)
+        total_len = len(element.get_text().strip())
+        if total_len > 0 and tibetan_len / total_len > 0.5:
+            return True
 
-    # Check character content
-    text = element.get_text()
-    if not text or len(text.strip()) < 5:
-        return False
-
-    tibetan_chars = len(TIBETAN_RE.findall(text))
-    total_chars = len(text.strip())
-    if total_chars > 0 and tibetan_chars / total_chars > 0.3:
-        return True
+    # Fallback: check Unicode content for elements without class
+    if not classes:
+        text = element.get_text()
+        if text and len(text.strip()) > 5:
+            tibetan_chars = len(TIBETAN_RE.findall(text))
+            total_chars = len(text.strip())
+            if total_chars > 0 and tibetan_chars / total_chars > 0.3:
+                return True
 
     return False
 
@@ -124,6 +137,12 @@ def extract_text_from_html(filepath: Path) -> dict:
     """
     Extract English text and metadata from a Lotsawa House HTML file.
 
+    Uses the site's CSS class conventions:
+      - div#maintext: main content container
+      - div.categories a.tag-circle: topic tags
+      - .TibetanVerse, .HeadingTib: Tibetan script (skip)
+      - .EnglishText, .EnglishPhonetics, .Heading3: English content (keep)
+
     Returns dict with title, author, translator, text, topics, etc.
     """
     try:
@@ -131,10 +150,6 @@ def extract_text_from_html(filepath: Path) -> dict:
             soup = BeautifulSoup(f.read(), "html.parser")
     except Exception:
         return {}
-
-    # Remove script, style, nav elements
-    for tag in soup.find_all(["script", "style", "nav"]):
-        tag.decompose()
 
     # Title: from <h1> or <title> tag
     title = ""
@@ -145,69 +160,68 @@ def extract_text_from_html(filepath: Path) -> dict:
         title_tag = soup.find("title")
         if title_tag:
             title = title_tag.get_text(strip=True)
-            # Strip " | Lotsawa House" suffix
             title = re.sub(r'\s*\|\s*Lotsawa House\s*$', '', title)
 
-    # Translator: look for "Translated by" pattern
+    # Topics: from div.categories a.tag-circle[href^="/topics/"]
+    topics = []
+    categories_div = soup.find("div", class_="categories")
+    if categories_div:
+        for a in categories_div.find_all("a", href=re.compile(r'^/topics/')):
+            topic_name = a.get_text(strip=True)
+            if topic_name and topic_name not in topics:
+                topics.append(topic_name)
+
+    # Translator: look for "Translated by" in page text
     translator = ""
     page_text = soup.get_text()
-
-    # Pattern: "Translated by Name, Year" or "Translated by Name and Name"
     trans_match = re.search(
         r'[Tt]ranslated\s+by\s+([A-Z][^,\n\d]{2,80})(?:[,.]|\s+\d{4})',
         page_text,
     )
     if trans_match:
         translator = trans_match.group(1).strip()
-        # Clean up trailing connectives
         translator = re.sub(r'\s+(?:and|with|under|for)$', '', translator, flags=re.IGNORECASE)
 
-    # Also check for translator links
     if not translator:
         trans_link = soup.find("a", href=re.compile(r'/translators/'))
         if trans_link:
             translator = trans_link.get_text(strip=True)
 
-    # Topics: extract from /topics/ links
-    topics = []
-    for a in soup.find_all("a", href=re.compile(r'^/topics/')):
-        topic_name = a.get_text(strip=True)
-        if topic_name and topic_name not in topics:
-            topics.append(topic_name)
-
-    # Author: extract from path structure or page content
+    # Author: "by Author Name" pattern near the beginning of the content
     author = ""
-    # "by Author Name" pattern near the title
-    by_match = re.search(r'\bby\s+([A-Z][A-Za-z\s\-\']+?)(?:\s*\(|\s*$|\s*\n)', page_text[:2000])
-    if by_match:
-        candidate = by_match.group(1).strip()
-        if len(candidate) < 80:
-            author = candidate
+    content_div = soup.find(id="content")
+    if content_div:
+        content_text = content_div.get_text()[:1000]
+        by_match = re.search(r'\bby\s+([A-Z][A-Za-z\u00C0-\u024F\s\-\']+?)(?:\s*\(|\s*$|\s*\n)', content_text)
+        if by_match:
+            candidate = by_match.group(1).strip()
+            if len(candidate) < 80:
+                author = candidate
 
-    # Body text: extract English paragraphs, skip Tibetan
-    body = soup.find("body")
-    if not body:
+    # Body text: extract from div#maintext, filtering by CSS class
+    maintext = soup.find(id="maintext")
+    if not maintext:
+        # Fallback: try div#content
+        maintext = soup.find(id="content")
+    if not maintext:
         return {}
 
     text_parts = []
-    for element in body.find_all(["p", "blockquote", "h2", "h3", "h4"]):
-        # Skip Tibetan script paragraphs
-        if is_tibetan_text(element):
+    for element in maintext.find_all(["p", "blockquote", "h2", "h3", "h4"]):
+        # Skip Tibetan script elements
+        if is_tibetan_element(element):
+            continue
+
+        # Skip language list, gaps
+        elem_id = element.get("id", "")
+        if elem_id == "lang-list":
+            continue
+        classes = element.get("class", [])
+        if "gap" in classes:
             continue
 
         text = element.get_text(separator=" ", strip=True)
-
-        # Skip very short fragments, navigation, and boilerplate
-        if not text or len(text) < 20:
-            continue
-
-        # Skip common boilerplate patterns
-        lower = text.lower()
-        if any(bp in lower for bp in [
-            "creative commons", "lotsawa house", "issn 2753",
-            "all rights reserved", "download epub", "download pdf",
-            "this work is licensed", "version:", "donate",
-        ]):
+        if not text or len(text) < 10:
             continue
 
         text_parts.append(text)
@@ -219,18 +233,15 @@ def extract_text_from_html(filepath: Path) -> dict:
     full_text = re.sub(r'\n\s*\n\s*\n+', '\n\n', full_text)
 
     # Derive path info
-    rel_parts = filepath.relative_to(filepath.parent.parent) if len(filepath.parts) > 2 else filepath
     source_section = ""
     master_slug = ""
     text_slug = filepath.stem
 
-    # Determine section from path
     for section in ["words-of-the-buddha", "tibetan-masters", "indian-masters"]:
         if section in str(filepath):
             source_section = section
             break
 
-    # For master texts, extract master slug from parent directory
     if source_section in ("tibetan-masters", "indian-masters"):
         master_slug = filepath.parent.name
         if not author:
@@ -373,5 +384,6 @@ if __name__ == "__main__":
     chunks = ingest_lotsawahouse(sys.argv[1])
     print(f"Total chunks: {len(chunks)}")
     if chunks:
-        print(f"Sample: {chunks[0].text[:200]}...")
+        sample = chunks[0].text[:200].encode("ascii", errors="replace").decode()
+        print(f"Sample: {sample}...")
         print(f"Metadata: {chunks[0].metadata}")
