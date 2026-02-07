@@ -6,4 +6,5 @@ Parsers for various Buddhist text sources:
   - Access to Insight (HTML)
   - 84000.co Tibetan canon (TEI/XML)
   - Lotsawa House (HTML, scraped)
+  - Wikipedia Buddhism articles (JSON, scraped via MediaWiki API)
 """

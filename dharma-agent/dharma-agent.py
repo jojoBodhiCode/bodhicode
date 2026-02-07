@@ -990,8 +990,9 @@ def action_manage_kb(cfg):
     print("  [2] Ingest Access to Insight")
     print("  [3] Ingest 84000.co texts")
     print("  [4] Ingest Lotsawa House")
-    print("  [5] Search knowledge base")
-    print("  [6] Clear knowledge base")
+    print("  [5] Ingest Wikipedia Buddhism")
+    print("  [6] Search knowledge base")
+    print("  [7] Clear knowledge base")
     print("  [x] Back")
     choice = input("  Choice: ").strip().lower()
 
@@ -1043,6 +1044,42 @@ def action_manage_kb(cfg):
             print("  💡 Download first with: python -m ingest.scrape_lotsawahouse C:/llama-cpp/lotsawahouse-data")
 
     elif choice == "5":
+        default_path = "C:/llama-cpp/wikipedia-buddhism-data"
+        path = input(f"  Path to Wikipedia cache [{default_path}]: ").strip() or default_path
+
+        # Check if scrape is needed
+        from pathlib import Path as _Path
+        cache_dir = _Path(path)
+        articles_dir = cache_dir / "articles"
+        has_articles = articles_dir.exists() and any(articles_dir.glob("*.json"))
+
+        if not has_articles:
+            print(f"  No cached articles found at {path}")
+            scrape = input("  Run Wikipedia scraper first? (Y/n): ").strip().lower()
+            if scrape != "n":
+                try:
+                    from ingest.scrape_wikipedia_buddhism import scrape_wikipedia_buddhism
+                    depth = input("  Max category depth [4]: ").strip()
+                    depth = int(depth) if depth else 4
+                    max_art = input("  Max articles [2000]: ").strip()
+                    max_art = int(max_art) if max_art else 2000
+                    scrape_wikipedia_buddhism(
+                        output_dir=path, max_depth=depth, max_articles=max_art,
+                    )
+                except Exception as e:
+                    print(f"  ❌ Scraper error: {e}")
+                    return
+
+        # Now ingest
+        try:
+            from ingest.ingest_wikipedia import ingest_wikipedia
+            chunks = ingest_wikipedia(path)
+            if chunks:
+                rag.index_chunks(chunks)
+        except Exception as e:
+            print(f"  ❌ Error: {e}")
+
+    elif choice == "6":
         query = input("  Search query: ").strip()
         if query:
             results = rag.search_direct(query, k=5)
@@ -1055,7 +1092,7 @@ def action_manage_kb(cfg):
                     print(f"      Similarity: {r['similarity']:.0%}")
                     print(f"      {r['text'][:200]}...")
 
-    elif choice == "6":
+    elif choice == "7":
         confirm = input("  Are you sure? This deletes all indexed texts. (y/N): ").strip().lower()
         if confirm == "y":
             rag.clear()
