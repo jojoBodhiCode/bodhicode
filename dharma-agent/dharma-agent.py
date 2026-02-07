@@ -989,8 +989,9 @@ def action_manage_kb(cfg):
     print("  [1] Ingest SuttaCentral bilara-data")
     print("  [2] Ingest Access to Insight")
     print("  [3] Ingest 84000.co texts")
-    print("  [4] Search knowledge base")
-    print("  [5] Clear knowledge base")
+    print("  [4] Ingest Lotsawa House")
+    print("  [5] Search knowledge base")
+    print("  [6] Clear knowledge base")
     print("  [x] Back")
     choice = input("  Choice: ").strip().lower()
 
@@ -1028,6 +1029,20 @@ def action_manage_kb(cfg):
                 print(f"  ❌ Error: {e}")
 
     elif choice == "4":
+        path = input("  Path to Lotsawa House local cache (e.g. C:/llama-cpp/lotsawahouse-data): ").strip()
+        if path:
+            try:
+                from ingest.ingest_lotsawahouse import ingest_lotsawahouse
+                chunks = ingest_lotsawahouse(path)
+                if chunks:
+                    rag.index_chunks(chunks)
+            except Exception as e:
+                print(f"  ❌ Error: {e}")
+        else:
+            print("  No path provided.")
+            print("  💡 Download first with: python -m ingest.scrape_lotsawahouse C:/llama-cpp/lotsawahouse-data")
+
+    elif choice == "5":
         query = input("  Search query: ").strip()
         if query:
             results = rag.search_direct(query, k=5)
@@ -1040,7 +1055,7 @@ def action_manage_kb(cfg):
                     print(f"      Similarity: {r['similarity']:.0%}")
                     print(f"      {r['text'][:200]}...")
 
-    elif choice == "5":
+    elif choice == "6":
         confirm = input("  Are you sure? This deletes all indexed texts. (y/N): ").strip().lower()
         if confirm == "y":
             rag.clear()
