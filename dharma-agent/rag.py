@@ -96,6 +96,8 @@ class DharmaRAG:
         """
         prefixed = [f"{prefix}{t}" for t in texts]
         embeddings = self.embedder.encode(prefixed, batch_size=_ENCODE_BATCH, show_progress_bar=len(texts) > 50)
+        if _DEVICE.startswith("cuda"):
+            torch.cuda.empty_cache()
         return embeddings.tolist()
 
     def index_chunks(self, chunks: List[TextChunk], show_progress: bool = True) -> int:
