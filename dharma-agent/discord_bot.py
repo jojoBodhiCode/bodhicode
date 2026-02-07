@@ -31,6 +31,7 @@ except ImportError:
     sys.exit(1)
 
 from prompts import SYSTEM_PROMPT, TEMPERATURE_FACTUAL
+from journal import add_entry as journal_add, format_for_prompt as journal_prompt
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -272,8 +273,13 @@ async def on_message(message):
         if len(history) > MAX_HISTORY:
             history[:] = history[-MAX_HISTORY:]
 
-        # Build full messages list with system prompt
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+        # Build full messages list with system prompt + journal memory
+        journal_section = journal_prompt()
+        if journal_section:
+            system_with_memory = f"{SYSTEM_PROMPT}\n\n{journal_section}"
+        else:
+            system_with_memory = SYSTEM_PROMPT
+        messages = [{"role": "system", "content": system_with_memory}] + history
 
         # Generate response (this blocks for 30-60s, typing indicator stays active)
         import asyncio
@@ -285,7 +291,7 @@ async def on_message(message):
         if response is None and len(history) > 1:
             print("  [Discord] Retrying without conversation history...")
             history[:] = [{"role": "user", "content": augmented_question}]
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+            messages = [{"role": "system", "content": system_with_memory}] + history
             response = await asyncio.get_event_loop().run_in_executor(
                 None, generate_response, messages
             )
@@ -300,6 +306,15 @@ async def on_message(message):
 
         # Add assistant response to history (use clean version without RAG context)
         history.append({"role": "assistant", "content": response})
+
+        # Log to journal for persistent memory
+        journal_add(
+            user=str(message.author),
+            channel=channel_name,
+            question=question,
+            sources=source_ids if source_ids else None,
+            response_snippet=response[:150],
+        )
 
         # Append source citations
         if source_ids:
