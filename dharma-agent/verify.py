@@ -141,13 +141,46 @@ def extract_entities(text: str) -> List[Tuple[str, str]]:
     return mentions
 
 
-def verify_content(text: str, entity_db: Optional[EntityDatabase] = None) -> VerificationReport:
+def _check_entity_in_rag(name: str, rag_instance) -> float:
     """
-    Verify a piece of generated content against the known-entities database.
+    Check if an entity name appears in RAG search results.
+
+    Returns a confidence boost (0.0 to 0.8) based on how well
+    the entity matches documents in the knowledge base.
+    """
+    try:
+        results = rag_instance.search_direct(name, k=3)
+        if not results:
+            return 0.0
+        # Check if the entity name actually appears in retrieved text
+        best_sim = results[0]["similarity"]
+        name_lower = name.lower()
+        for r in results:
+            if name_lower in r["text"].lower():
+                return min(0.8, best_sim)
+            # Check metadata too
+            meta = r.get("metadata", {})
+            meta_text = " ".join(str(v) for v in meta.values()).lower()
+            if name_lower in meta_text:
+                return min(0.8, best_sim)
+        # Found similar content but name not explicitly present
+        if best_sim > 0.7:
+            return 0.5
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def verify_content(text: str, entity_db: Optional[EntityDatabase] = None,
+                   rag_instance=None) -> VerificationReport:
+    """
+    Verify a piece of generated content against the known-entities database
+    and optionally the RAG knowledge base.
 
     Args:
         text: The generated text to verify
         entity_db: EntityDatabase instance (creates default if None)
+        rag_instance: Optional DharmaRAG instance for KB-backed verification
 
     Returns:
         VerificationReport with verified/unverified entities and confidence score
@@ -160,9 +193,16 @@ def verify_content(text: str, entity_db: Optional[EntityDatabase] = None) -> Ver
     # Extract entity mentions
     mentions = extract_entities(text)
 
-    # Verify each mention
+    # Verify each mention against entity DB, then RAG if needed
     for name, ctx in mentions:
         entity_type, confidence = entity_db.verify_entity(name)
+
+        # If entity DB doesn't know it, try RAG as a fallback
+        if confidence < 0.5 and rag_instance is not None:
+            rag_boost = _check_entity_in_rag(name, rag_instance)
+            if rag_boost > 0:
+                confidence = rag_boost
+                entity_type = "kb-verified"
 
         mention = EntityMention(
             name=name,

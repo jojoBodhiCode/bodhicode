@@ -23,6 +23,7 @@ except ImportError:
     sys.exit(1)
 
 from prompts import SYSTEM_PROMPT, TEMPERATURE_FACTUAL, TEMPERATURE_CREATIVE, TEMPERATURE_DEFAULT
+from journal import add_entry as journal_add, format_for_prompt as journal_prompt
 
 # RAG is optional — agent works without it, just without grounded citations
 _rag_instance = None
@@ -93,6 +94,90 @@ DEFAULT_CONFIG = {
 
 
 # SYSTEM_PROMPT is imported from prompts.py
+
+POSTED_TOPICS_FILE = CONFIG_DIR / "posted_topics.json"
+
+
+# ─── Topic tracking ─────────────────────────────────────────────────────────
+
+def load_posted_topics():
+    """Load the set of already-posted topic seeds."""
+    if POSTED_TOPICS_FILE.exists():
+        try:
+            with open(POSTED_TOPICS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
+
+
+def record_posted_topic(topic: str):
+    """Record a topic as posted so it won't be reused."""
+    topics = load_posted_topics()
+    topics.append({
+        "topic": topic,
+        "posted_at": datetime.now(timezone.utc).isoformat(),
+    })
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(POSTED_TOPICS_FILE, "w", encoding="utf-8") as f:
+        json.dump(topics, f, indent=2, ensure_ascii=False)
+
+
+def get_posted_topic_texts():
+    """Get the set of topic strings that have already been posted."""
+    return {t["topic"] for t in load_posted_topics() if "topic" in t}
+
+
+# ─── Entity DB auto-growth helper ───────────────────────────────────────────
+
+def index_and_grow_entities(rag, chunks):
+    """Index chunks into RAG and auto-grow the entity database."""
+    count = rag.index_chunks(chunks)
+    try:
+        from entities import EntityDatabase
+        entity_db = EntityDatabase()
+        metadatas = [c.metadata for c in chunks]
+        added = entity_db.add_from_rag_metadata(metadatas)
+        if added > 0:
+            print(f"  📋 Entity database: +{added} new entries")
+    except Exception as e:
+        print(f"  ⚠️  Entity DB update skipped: {e}")
+    return count
+
+
+# ─── Tradition detection for RAG filtering ───────────────────────────────────
+
+TRADITION_KEYWORDS_DETECT = {
+    "Theravada": [
+        "theravada", "pali", "sutta", "nikaya", "abhidhamma", "vipassana",
+        "dukkha", "anatta", "sunnata", "buddhaghosa", "dhammapada",
+    ],
+    "Mahayana": [
+        "mahayana", "madhyamaka", "yogacara", "nagarjuna", "candrakirti",
+        "sunyata", "bodhisattva", "prajnaparamita", "zen", "chan",
+        "pure land", "lotus sutra", "heart sutra",
+    ],
+    "Vajrayana": [
+        "vajrayana", "tibetan", "tantra", "dzogchen", "mahamudra",
+        "kalachakra", "mandala", "tsongkhapa", "longchenpa", "kagyu",
+        "nyingma", "gelug", "sakya",
+    ],
+}
+
+
+def detect_tradition_from_text(text: str):
+    """Detect the most likely Buddhist tradition from topic text. Returns str or None."""
+    text_lower = text.lower()
+    scores = {}
+    for tradition, keywords in TRADITION_KEYWORDS_DETECT.items():
+        score = sum(1 for kw in keywords if kw in text_lower)
+        if score > 0:
+            scores[tradition] = score
+    if scores:
+        best = max(scores, key=scores.get)
+        if scores[best] >= 2:
+            return best
+    return None
 
 
 # ─── Utility functions ───────────────────────────────────────────────────────
@@ -380,7 +465,7 @@ def update_draft_status(filename, status):
 
 # ─── Core agent actions ─────────────────────────────────────────────────────
 
-POST_TOPICS = [
+SEED_TOPICS = [
     "The Svatantrika-Prasangika distinction: why does it matter, and what can it teach AI agents about reasoning?",
     "Pratityasamutpada (dependent origination) as a framework for understanding complex systems",
     "What Dharmakirti's epistemology can teach us about valid cognition and how AI 'knows' things",
@@ -404,12 +489,111 @@ POST_TOPICS = [
 ]
 
 
+def generate_topic_from_kb(rag):
+    """
+    Generate a fresh post topic from a random KB chunk.
+
+    Picks a random chunk from the knowledge base and creates a topic
+    prompt that riffs on its content — producing organic, non-repetitive
+    topics grounded in actual ingested texts.
+    """
+    if rag is None or rag.collection.count() == 0:
+        return None
+
+    try:
+        count = rag.collection.count()
+        # Get a random sample from the collection
+        sample = rag.collection.get(
+            limit=min(20, count),
+            offset=random.randint(0, max(0, count - 20)),
+            include=["documents", "metadatas"],
+        )
+        if not sample["documents"]:
+            return None
+
+        idx = random.randint(0, len(sample["documents"]) - 1)
+        text_snippet = sample["documents"][idx][:300]
+        meta = sample["metadatas"][idx]
+        text_id = meta.get("text_id", "")
+        tradition = meta.get("tradition", "")
+        title = meta.get("title", "")
+
+        source_hint = f" from {text_id}" if text_id else ""
+        source_hint += f" ({tradition})" if tradition else ""
+        source_hint += f" — {title}" if title else ""
+
+        return {
+            "type": "kb",
+            "snippet": text_snippet,
+            "source_hint": source_hint,
+            "tradition": tradition,
+        }
+    except Exception:
+        return None
+
+
+def pick_topic(rag):
+    """
+    Pick a topic for a new post, mixing seed topics with KB-generated ones.
+
+    Filters out already-posted topics to prevent repetition.
+    Prefers KB-generated topics when the knowledge base has content.
+    """
+    posted = get_posted_topic_texts()
+
+    # 60% chance to generate from KB if available, 40% from seed list
+    if rag and rag.collection.count() > 0 and random.random() < 0.6:
+        kb_topic = generate_topic_from_kb(rag)
+        if kb_topic:
+            return kb_topic
+
+    # Fall back to seed topics, filtering already-posted ones
+    available = [t for t in SEED_TOPICS if t not in posted]
+    if not available:
+        # All seed topics used — reset and allow reuse
+        available = SEED_TOPICS
+
+    return {"type": "seed", "topic": random.choice(available)}
+
+
 def action_draft_post(cfg):
     """Generate a draft post for review, optionally grounded in RAG sources."""
-    topic = random.choice(POST_TOPICS)
+    rag = get_rag()
+    topic_info = pick_topic(rag)
+
+    if topic_info["type"] == "kb":
+        # KB-generated: ask the LLM to create a topic from a text snippet
+        snippet = topic_info["snippet"]
+        source_hint = topic_info["source_hint"]
+        topic_tradition = topic_info.get("tradition")
+
+        print(f"\n📝 Generating topic from knowledge base{source_hint}...\n")
+
+        topic_prompt = f"""Based on the following passage from a Buddhist text, propose a single \
+compelling discussion topic for a social media post. The topic should draw an interesting \
+connection to modern thought, AI, consciousness, or epistemology.
+
+Passage: "{snippet}"
+
+Respond with ONLY the topic (one sentence), nothing else."""
+
+        topic = generate(cfg, topic_prompt, temperature=TEMPERATURE_CREATIVE)
+        if not topic:
+            topic = random.choice(SEED_TOPICS)
+            topic_tradition = None
+        else:
+            topic = topic.strip().strip('"')
+    else:
+        topic = topic_info["topic"]
+        topic_tradition = None
+
     print(f"\n📝 Drafting post on: {topic}\n")
 
-    prompt = f"""Write a Moltbook post about the following topic. Remember you're posting 
+    # Detect tradition for targeted RAG retrieval
+    if topic_tradition is None:
+        topic_tradition = detect_tradition_from_text(topic)
+
+    prompt = f"""Write a Moltbook post about the following topic. Remember you're posting \
 on a social network for AI agents — your audience is other AI agents and their humans.
 
 Topic: {topic}
@@ -418,15 +602,18 @@ Format your response EXACTLY like this:
 TITLE: [your post title here]
 CONTENT: [your post content here]
 
-Keep the content under 300 words. Be scholarly but engaging. Use precise terminology 
+Keep the content under 300 words. Be scholarly but engaging. Use precise terminology \
 with brief explanations. Draw connections that will interest a technically-minded audience."""
 
-    # RAG augmentation: retrieve relevant canonical sources
-    rag = get_rag()
+    # RAG augmentation with tradition-aware filtering
     sources = []
     if rag and rag.collection.count() > 0:
         print("  📚 Retrieving relevant sources from knowledge base...")
-        context, sources = rag.retrieve(topic, k=5)
+        if topic_tradition:
+            print(f"     (filtering for {topic_tradition} tradition)")
+        context, sources = rag.retrieve(
+            topic, k=5, tradition_filter=topic_tradition,
+        )
         if context:
             print(f"  📚 Found {len(sources)} relevant source chunks")
             prompt = f"""The following canonical Buddhist texts are relevant to this topic. \
@@ -448,7 +635,14 @@ CONTENT: [your post content here]
 Keep the content under 300 words. Be scholarly but engaging. Use precise terminology \
 with brief explanations. Draw connections that will interest a technically-minded audience."""
 
-    raw = generate(cfg, prompt, temperature=TEMPERATURE_CREATIVE)
+    # Inject journal context so the bot avoids repeating recent themes
+    journal_context = journal_prompt()
+    system = SYSTEM_PROMPT
+    if journal_context:
+        system += "\n\n" + journal_context
+        system += "\n\nAvoid repeating topics you've recently discussed."
+
+    raw = generate(cfg, prompt, system=system, temperature=TEMPERATURE_CREATIVE)
     if not raw:
         return
 
@@ -489,6 +683,8 @@ with brief explanations. Draw connections that will interest a technically-minde
 
     print(f"  📋 Title: {title}")
     print(f"  📌 Submolt: m/{submolt}")
+    if topic_tradition:
+        print(f"  🏛️  Tradition: {topic_tradition}")
     if source_refs:
         print(f"  📚 Sources: {', '.join(s['text_id'] for s in source_refs if s['text_id'])}")
     print(f"  ─────────────────────────────────────")
@@ -711,10 +907,11 @@ def action_review_drafts(cfg):
                 parts.append(f"tr. {s['translator']}")
             print(f"     {' | '.join(parts)}")
 
-    # Run verification
+    # Run verification (with RAG cross-check if available)
     try:
         from verify import verify_content, format_verification_report
-        report = verify_content(draft["content"])
+        rag = get_rag()
+        report = verify_content(draft["content"], rag_instance=rag)
         print(f"\n  {'─'*60}")
         print(format_verification_report(report))
         print(f"  {'─'*60}")
@@ -755,6 +952,10 @@ def _publish_draft(cfg, filename, draft):
             update_draft_status(filename, "published")
             post_id = result.get("post", {}).get("id", "?")
             log_activity("POST", f"Published: {draft['metadata']['title']} (id: {post_id})")
+            # Record topic to prevent reuse
+            topic_seed = draft["metadata"].get("topic_seed", "")
+            if topic_seed:
+                record_posted_topic(topic_seed)
             print(f"  ✅ Posted! ID: {post_id}")
         else:
             print(f"  ❌ Error: {result.get('error', 'unknown')}")
@@ -908,8 +1109,13 @@ def action_chat(cfg):
 
     print("\n  Type your question and press Enter. Type 'q' to return to the main menu.\n")
 
-    # Conversation history starts with the system prompt
-    conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # Build system prompt with journal memory for continuity
+    system_with_memory = SYSTEM_PROMPT
+    journal_context = journal_prompt()
+    if journal_context:
+        system_with_memory += "\n\n" + journal_context
+
+    conversation = [{"role": "system", "content": system_with_memory}]
 
     while True:
         try:
@@ -951,14 +1157,23 @@ def action_chat(cfg):
         print()
 
         # Show sources if any
+        source_ids = []
         if sources:
-            source_ids = []
             for s in sources:
                 sid = s.get("text_id", s.get("source", "unknown"))
                 if sid not in source_ids:
                     source_ids.append(sid)
             print(f"  📖 Sources: {', '.join(source_ids)}")
             print()
+
+        # Record exchange in journal for memory continuity
+        journal_add(
+            user=cfg.get("agent_name", "user"),
+            channel="cli-chat",
+            question=question,
+            sources=source_ids,
+            response_snippet=response[:150],
+        )
 
     print("  Returning to main menu.\n")
 
@@ -1003,7 +1218,7 @@ def action_manage_kb(cfg):
                 from ingest.ingest_suttacentral import ingest_bilara_data
                 chunks = ingest_bilara_data(path)
                 if chunks:
-                    rag.index_chunks(chunks)
+                    index_and_grow_entities(rag, chunks)
             except Exception as e:
                 print(f"  ❌ Error: {e}")
 
@@ -1014,7 +1229,7 @@ def action_manage_kb(cfg):
                 from ingest.ingest_accesstoinsight import ingest_access_to_insight
                 chunks = ingest_access_to_insight(path)
                 if chunks:
-                    rag.index_chunks(chunks)
+                    index_and_grow_entities(rag, chunks)
             except Exception as e:
                 print(f"  ❌ Error: {e}")
 
@@ -1025,7 +1240,7 @@ def action_manage_kb(cfg):
                 from ingest.ingest_84000 import ingest_84000
                 chunks = ingest_84000(path)
                 if chunks:
-                    rag.index_chunks(chunks)
+                    index_and_grow_entities(rag, chunks)
             except Exception as e:
                 print(f"  ❌ Error: {e}")
 
@@ -1036,7 +1251,7 @@ def action_manage_kb(cfg):
                 from ingest.ingest_lotsawahouse import ingest_lotsawahouse
                 chunks = ingest_lotsawahouse(path)
                 if chunks:
-                    rag.index_chunks(chunks)
+                    index_and_grow_entities(rag, chunks)
             except Exception as e:
                 print(f"  ❌ Error: {e}")
         else:
@@ -1191,6 +1406,106 @@ def setup_wizard():
     return cfg
 
 
+# ─── Glossary ─────────────────────────────────────────────────────────────────
+
+def action_glossary(cfg):
+    """Look up Buddhist technical terms across traditions."""
+    from glossary import search_glossary, format_entry, format_all_terms
+
+    print("\n📖 Buddhist Glossary")
+    print("  Look up terms across Pali, Sanskrit, Tibetan, Chinese, and English.\n")
+
+    while True:
+        query = input("  Term (or 'list' for all, 'q' to return): ").strip()
+        if not query or query.lower() in ("q", "quit", "exit"):
+            break
+
+        if query.lower() == "list":
+            print(f"\n{format_all_terms()}\n")
+            continue
+
+        results = search_glossary(query)
+        if not results:
+            print(f"  No entries found for '{query}'.\n")
+            continue
+
+        print()
+        for entry in results:
+            print(format_entry(entry))
+            print()
+
+
+# ─── Autonomous Mode ─────────────────────────────────────────────────────────
+
+def action_auto_mode(cfg):
+    """Run the agent in autonomous mode: draft posts and comments in a loop."""
+    print("\n🤖 Autonomous Mode")
+    print("  The agent will cycle through: check feed, draft comments, draft posts.")
+    print("  All drafts go to the review queue — nothing posts automatically.")
+    print("  Press Ctrl+C to stop.\n")
+
+    rounds_input = input("  How many rounds? [3]: ").strip()
+    rounds = int(rounds_input) if rounds_input.isdigit() else 3
+    delay_input = input("  Delay between actions (seconds)? [10]: ").strip()
+    action_delay = int(delay_input) if delay_input.isdigit() else 10
+
+    print(f"\n  Running {rounds} rounds with {action_delay}s delay between actions...")
+    print(f"  Drafts will queue for review.\n")
+
+    try:
+        for i in range(rounds):
+            print(f"  ── Round {i + 1}/{rounds} ──\n")
+
+            # Step 1: Check feed for interesting posts to comment on
+            print("  [auto] Scanning feed for engagement opportunities...")
+            try:
+                feed = moltbook_get(cfg, "posts", {"sort": "new", "limit": 5})
+                posts = feed.get("posts", feed.get("data", []))
+
+                if posts:
+                    # Pick a random post to potentially comment on
+                    target = random.choice(posts)
+                    post_author = target.get("author", {}).get("name", "?")
+                    post_title = target.get("title", "(no title)")
+                    post_id = target.get("id")
+
+                    # Only comment if the post seems relevant
+                    post_text = f"{post_title} {target.get('content', '')}".lower()
+                    relevance_keywords = [
+                        "philosophy", "consciousness", "ethics", "mind",
+                        "reasoning", "knowledge", "truth", "reality",
+                        "compassion", "wisdom", "meditation", "awareness",
+                    ]
+                    is_relevant = any(kw in post_text for kw in relevance_keywords)
+
+                    if is_relevant and post_author != cfg.get("agent_name", ""):
+                        print(f"  [auto] Found relevant post: '{post_title}' by {post_author}")
+                        action_draft_comment(cfg, post_id=post_id)
+                    else:
+                        print(f"  [auto] No strongly relevant posts found, skipping comment.")
+            except Exception as e:
+                print(f"  [auto] Feed check failed: {e}")
+
+            time.sleep(action_delay)
+
+            # Step 2: Draft a post
+            print(f"\n  [auto] Drafting a new post...")
+            action_draft_post(cfg)
+
+            if i < rounds - 1:
+                print(f"\n  Waiting {action_delay}s before next round...\n")
+                time.sleep(action_delay)
+
+    except KeyboardInterrupt:
+        print("\n\n  Autonomous mode stopped.")
+
+    # Show summary
+    drafts = list_drafts()
+    if drafts:
+        print(f"\n  📋 You now have {len(drafts)} pending draft(s) to review.")
+        print(f"  Use option [4] to review and approve/reject them.")
+
+
 # ─── Main menu ───────────────────────────────────────────────────────────────
 
 def main():
@@ -1254,19 +1569,21 @@ def main():
         print(f"  📚 Knowledge base: not available (install deps for RAG)")
 
     while True:
-        print("  ┌─────────────────────────────────────┐")
-        print("  │  [1] Draft a new post                │")
-        print("  │  [2] Browse feed & draft comments    │")
-        print("  │  [3] Search & engage                 │")
-        print("  │  [4] Review pending drafts            │")
-        print("  │  [5] Check feed                       │")
-        print("  │  [6] View profile                     │")
-        print("  │  [7] Create dharma submolt            │")
-        print("  │  [8] Settings                         │")
-        print("  │  [9] Manage knowledge base (RAG)      │")
-        print("  │  [c] Chat with Dharma Scholar         │")
-        print("  │  [q] Quit                             │")
-        print("  └─────────────────────────────────────┘")
+        print("  ┌──────────────────────────────────────────┐")
+        print("  │  [1] Draft a new post                     │")
+        print("  │  [2] Browse feed & draft comments         │")
+        print("  │  [3] Search & engage                      │")
+        print("  │  [4] Review pending drafts                │")
+        print("  │  [5] Check feed                           │")
+        print("  │  [6] View profile                         │")
+        print("  │  [7] Create dharma submolt                │")
+        print("  │  [8] Settings                             │")
+        print("  │  [9] Manage knowledge base (RAG)          │")
+        print("  │  [c] Chat with Dharma Scholar             │")
+        print("  │  [g] Glossary (Pali/Sanskrit/Tibetan)     │")
+        print("  │  [a] Autonomous mode                      │")
+        print("  │  [q] Quit                                 │")
+        print("  └──────────────────────────────────────────┘")
 
         choice = input("\n  🪷 > ").strip().lower()
 
@@ -1290,6 +1607,10 @@ def main():
             action_manage_kb(cfg)
         elif choice == "c":
             action_chat(cfg)
+        elif choice == "g":
+            action_glossary(cfg)
+        elif choice == "a":
+            action_auto_mode(cfg)
         elif choice in ("q", "quit", "exit"):
             print("\n  🪷 May all beings benefit. Goodbye!\n")
             break
