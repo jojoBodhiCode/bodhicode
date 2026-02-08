@@ -184,7 +184,7 @@ def detect_tradition_from_text(text: str):
 
 def load_config():
     if CONFIG_FILE.exists():
-        with open(CONFIG_FILE) as f:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
             cfg = json.load(f)
             # merge with defaults for any new keys
             for k, v in DEFAULT_CONFIG.items():
@@ -196,14 +196,14 @@ def load_config():
 
 def save_config(cfg):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
 
 
 def log_activity(action, detail=""):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG_FILE, "a") as f:
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {action}: {detail}\n")
 
 
@@ -216,91 +216,54 @@ def moltbook_headers(cfg):
 
 def moltbook_get(cfg, endpoint, params=None):
     url = f"{MOLTBOOK_BASE}/{endpoint}"
-    r = requests.get(url, headers=moltbook_headers(cfg), params=params, timeout=30)
-    return r.json()
+    try:
+        r = requests.get(url, headers=moltbook_headers(cfg), params=params, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        return {"error": f"HTTP {r.status_code}", "detail": str(e)}
+    except requests.RequestException as e:
+        return {"error": str(e)}
+    except ValueError:
+        return {"error": "Invalid JSON response from Moltbook"}
 
 
 def moltbook_post(cfg, endpoint, data):
     url = f"{MOLTBOOK_BASE}/{endpoint}"
-    r = requests.post(url, headers=moltbook_headers(cfg), json=data, timeout=30)
-    return r.json()
+    try:
+        r = requests.post(url, headers=moltbook_headers(cfg), json=data, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        return {"error": f"HTTP {r.status_code}", "detail": str(e)}
+    except requests.RequestException as e:
+        return {"error": str(e)}
+    except ValueError:
+        return {"error": "Invalid JSON response from Moltbook"}
 
 
 def moltbook_delete(cfg, endpoint):
     url = f"{MOLTBOOK_BASE}/{endpoint}"
-    r = requests.delete(url, headers=moltbook_headers(cfg), timeout=30)
-    return r.json()
+    try:
+        r = requests.delete(url, headers=moltbook_headers(cfg), timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        return {"error": f"HTTP {r.status_code}", "detail": str(e)}
+    except requests.RequestException as e:
+        return {"error": str(e)}
+    except ValueError:
+        return {"error": "Invalid JSON response from Moltbook"}
 
 
 # ─── Ollama integration ─────────────────────────────────────────────────────
 
-def ollama_generate(cfg, prompt, system=SYSTEM_PROMPT, temperature=TEMPERATURE_DEFAULT):
-    """Generate text using local Ollama model."""
-    url = f"{cfg['ollama_base_url']}/api/chat"
-    payload = {
-        "model": cfg["ollama_model"],
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-            "top_p": 0.9,
-            "num_predict": 1024,
-        },
-    }
-    try:
-        print(f"  ⏳ Generating with {cfg['ollama_model']} (this may take 30-60s on CPU)...")
-        r = requests.post(url, json=payload, timeout=300)
-        r.raise_for_status()
-        return r.json()["message"]["content"]
-    except requests.ConnectionError:
-        print("  ❌ Can't reach Ollama. Is it running? Start it with: ollama serve")
-        return None
-    except Exception as e:
-        print(f"  ❌ Ollama error: {e}")
-        return None
-
-
-def llama_server_generate(cfg, prompt, system=SYSTEM_PROMPT, temperature=TEMPERATURE_DEFAULT):
-    """Generate text using llama-server's OpenAI-compatible API."""
-    cfg["llama_server_url"] = normalize_url(cfg.get("llama_server_url", ""))
-    url = f"{cfg['llama_server_url']}/v1/chat/completions"
-    payload = {
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": temperature,
-        "top_p": 0.9,
-        "max_tokens": 1024,
-    }
-    try:
-        print(f"  ⏳ Generating with llama-server (this may take 2-4 min with 32B on CPU)...")
-        r = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=600)
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"]
-    except requests.ConnectionError:
-        print(f"  ❌ Can't reach llama-server at {cfg['llama_server_url']}")
-        print("  💡 Is llama-server.exe running? Check start_server.bat")
-        return None
-    except Exception as e:
-        print(f"  ❌ llama-server error: {e}")
-        return None
-
-
-def generate(cfg, prompt, system=SYSTEM_PROMPT, temperature=TEMPERATURE_DEFAULT):
-    """Generate text using the configured backend."""
-    if cfg.get("backend") == "llama-server":
-        return llama_server_generate(cfg, prompt, system, temperature)
-    else:
-        return ollama_generate(cfg, prompt, system, temperature)
-
-
 def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT):
-    """Generate a response from a full messages list (multi-turn conversation).
+    """Generate a response from a messages list.
+
+    This is the single LLM entry point. Both ollama and llama-server
+    paths are handled here. `generate()` is a convenience wrapper
+    that builds a messages list from a single prompt.
 
     Args:
         cfg: Config dict with backend settings.
@@ -329,6 +292,7 @@ def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT):
             return data["choices"][0]["message"]["content"]
         except requests.ConnectionError:
             print(f"  ❌ Can't reach llama-server at {cfg['llama_server_url']}")
+            print("  💡 Is llama-server.exe running? Check start_server.bat")
             return None
         except Exception as e:
             print(f"  ❌ llama-server error: {e}")
@@ -352,11 +316,20 @@ def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT):
             r.raise_for_status()
             return r.json()["message"]["content"]
         except requests.ConnectionError:
-            print("  ❌ Can't reach Ollama. Is it running?")
+            print("  ❌ Can't reach Ollama. Is it running? Start it with: ollama serve")
             return None
         except Exception as e:
             print(f"  ❌ Ollama error: {e}")
             return None
+
+
+def generate(cfg, prompt, system=SYSTEM_PROMPT, temperature=TEMPERATURE_DEFAULT):
+    """Generate text from a single prompt. Convenience wrapper around generate_chat."""
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ]
+    return generate_chat(cfg, messages, temperature=temperature)
 
 
 def check_ollama(cfg):
@@ -427,8 +400,8 @@ def save_draft(draft_type, content, metadata=None):
     }
     filename = f"{draft_type}_{ts}.json"
     filepath = DRAFTS_DIR / filename
-    with open(filepath, "w") as f:
-        json.dump(draft, f, indent=2)
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(draft, f, indent=2, ensure_ascii=False)
     return filename
 
 
@@ -438,7 +411,7 @@ def list_drafts():
         return []
     drafts = []
     for f in sorted(DRAFTS_DIR.glob("*.json")):
-        with open(f) as fh:
+        with open(f, encoding="utf-8") as fh:
             draft = json.load(fh)
             if draft.get("status") == "pending":
                 drafts.append((f.name, draft))
@@ -448,7 +421,7 @@ def list_drafts():
 def get_draft(filename):
     filepath = DRAFTS_DIR / filename
     if filepath.exists():
-        with open(filepath) as f:
+        with open(filepath, encoding="utf-8") as f:
             return json.load(f)
     return None
 
@@ -456,11 +429,33 @@ def get_draft(filename):
 def update_draft_status(filename, status):
     filepath = DRAFTS_DIR / filename
     if filepath.exists():
-        with open(filepath) as f:
+        with open(filepath, encoding="utf-8") as f:
             draft = json.load(f)
         draft["status"] = status
-        with open(filepath, "w") as f:
-            json.dump(draft, f, indent=2)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(draft, f, indent=2, ensure_ascii=False)
+
+
+def cleanup_old_drafts(days=7):
+    """Remove published/discarded drafts older than N days."""
+    if not DRAFTS_DIR.exists():
+        return 0
+    cutoff = datetime.now(timezone.utc).isoformat()
+    removed = 0
+    for f in DRAFTS_DIR.glob("*.json"):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                draft = json.load(fh)
+            if draft.get("status") in ("published", "discarded"):
+                created = draft.get("created_at", "")
+                if created:
+                    age = datetime.now(timezone.utc) - datetime.fromisoformat(created)
+                    if age.days >= days:
+                        f.unlink()
+                        removed += 1
+        except Exception:
+            continue
+    return removed
 
 
 # ─── Core agent actions ─────────────────────────────────────────────────────
@@ -502,18 +497,22 @@ def generate_topic_from_kb(rag):
 
     try:
         count = rag.collection.count()
-        # Get a random sample from the collection
-        sample = rag.collection.get(
-            limit=min(20, count),
-            offset=random.randint(0, max(0, count - 20)),
-            include=["documents", "metadatas"],
-        )
-        if not sample["documents"]:
+        # Use a random query from common Buddhist concepts to get diverse chunks
+        seed_queries = [
+            "emptiness dependent origination", "suffering noble truths",
+            "compassion bodhisattva path", "meditation practice insight",
+            "consciousness mind awareness", "karma rebirth liberation",
+            "impermanence non-self aggregates", "wisdom perfection prajna",
+            "buddha nature enlightenment", "ethics precepts conduct",
+        ]
+        seed_query = random.choice(seed_queries)
+        results = rag.search_direct(seed_query, k=10)
+        if not results:
             return None
 
-        idx = random.randint(0, len(sample["documents"]) - 1)
-        text_snippet = sample["documents"][idx][:300]
-        meta = sample["metadatas"][idx]
+        pick = random.choice(results)
+        text_snippet = pick["text"][:300]
+        meta = pick["metadata"]
         text_id = meta.get("text_id", "")
         tradition = meta.get("tradition", "")
         title = meta.get("title", "")
@@ -854,6 +853,11 @@ def action_search_engage(cfg):
 
 def action_review_drafts(cfg):
     """Review and approve/edit/reject pending drafts."""
+    # Auto-cleanup old published/discarded drafts
+    cleaned = cleanup_old_drafts(days=7)
+    if cleaned:
+        print(f"  🧹 Cleaned up {cleaned} old draft(s)")
+
     drafts = list_drafts()
     if not drafts:
         print("\n  ✅ No pending drafts!")
