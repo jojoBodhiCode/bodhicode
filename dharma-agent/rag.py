@@ -103,7 +103,18 @@ class DharmaRAG:
         nomic-embed-text supports task-type prefixes:
           - "search_document: " for documents being indexed
           - "search_query: " for queries at retrieval time
+
+        For small VRAM GPUs: bulk indexing runs on CPU, single queries use CUDA.
         """
+        is_query = len(texts) <= 2 and prefix.startswith("search_query")
+        if is_query and _QUERY_DEVICE != _DEVICE:
+            self.embedder = self.embedder.to(_QUERY_DEVICE)
+            prefixed = [f"{prefix}{t}" for t in texts]
+            embeddings = self.embedder.encode(prefixed, batch_size=1)
+            torch.cuda.empty_cache()
+            self.embedder = self.embedder.to(_DEVICE)
+            return embeddings.tolist()
+
         prefixed = [f"{prefix}{t}" for t in texts]
         embeddings = self.embedder.encode(prefixed, batch_size=_ENCODE_BATCH, show_progress_bar=len(texts) > 50)
         if _DEVICE.startswith("cuda"):
