@@ -42,7 +42,7 @@ DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "chroma_buddhist_db")
 DEFAULT_COLLECTION = "buddhist_texts"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 if torch.cuda.is_available():
-    _vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+    _vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
     if _vram_gb <= 2.5:
         # Small VRAM GPU — use CPU for bulk ingestion, CUDA for single queries
         _DEVICE = "cpu"
