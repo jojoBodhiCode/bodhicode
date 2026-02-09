@@ -42,13 +42,23 @@ DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "chroma_buddhist_db")
 DEFAULT_COLLECTION = "buddhist_texts"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 if torch.cuda.is_available():
-    _DEVICE = "cuda:0"
-    BATCH_SIZE = 16
-    _ENCODE_BATCH = 8  # very small encode batches for 2GB VRAM
+    _vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+    if _vram_gb <= 2.5:
+        # Small VRAM GPU — use CPU for bulk ingestion, CUDA for single queries
+        _DEVICE = "cpu"
+        BATCH_SIZE = 16
+        _ENCODE_BATCH = 16
+        _QUERY_DEVICE = "cuda:0"  # fast single-query embedding
+    else:
+        _DEVICE = "cuda:0"
+        BATCH_SIZE = 16
+        _ENCODE_BATCH = 8
+        _QUERY_DEVICE = "cuda:0"
 else:
     _DEVICE = "cpu"
     BATCH_SIZE = 100
     _ENCODE_BATCH = 64
+    _QUERY_DEVICE = "cpu"
 
 
 class DharmaRAG:
