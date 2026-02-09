@@ -43,7 +43,7 @@ DEFAULT_COLLECTION = "buddhist_texts"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-text-v1.5"
 if torch.cuda.is_available():
     _DEVICE = "cuda:0"
-    BATCH_SIZE = 32
+    BATCH_SIZE = 16
     _ENCODE_BATCH = 8  # very small encode batches for 2GB VRAM
 else:
     _DEVICE = "cpu"

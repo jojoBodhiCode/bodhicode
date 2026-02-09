@@ -28,6 +28,7 @@ accesstoinsight/
 84000-texts/
 84000-data-tei/
 lotsawahouse-data/
+wikipedia-buddhism-data/
 
 # Entity database (generated from ingested texts)
 dharma-agent/entities_db.json

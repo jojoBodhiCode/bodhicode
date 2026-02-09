@@ -30,6 +30,8 @@ except ImportError:
     print("Missing 'discord.py'. Install with: pip install discord.py")
     sys.exit(1)
 
+import asyncio
+
 from prompts import SYSTEM_PROMPT, TEMPERATURE_FACTUAL
 from journal import add_entry as journal_add, format_for_prompt as journal_prompt
 
@@ -248,8 +250,11 @@ async def on_message(message):
 
     # Show typing indicator while we generate
     async with message.channel.typing():
-        # RAG retrieval
-        context, sources = rag_retrieve(question)
+        # RAG retrieval (run in executor to avoid blocking the event loop)
+        loop = asyncio.get_event_loop()
+        context, sources = await loop.run_in_executor(
+            None, rag_retrieve, question
+        )
         source_ids = format_source_ids(sources)
 
         if source_ids:
@@ -274,7 +279,7 @@ async def on_message(message):
             history[:] = history[-MAX_HISTORY:]
 
         # Build full messages list with system prompt + journal memory
-        journal_section = journal_prompt()
+        journal_section = await loop.run_in_executor(None, journal_prompt)
         if journal_section:
             system_with_memory = f"{SYSTEM_PROMPT}\n\n{journal_section}"
         else:
@@ -282,8 +287,7 @@ async def on_message(message):
         messages = [{"role": "system", "content": system_with_memory}] + history
 
         # Generate response (this blocks for 30-60s, typing indicator stays active)
-        import asyncio
-        response = await asyncio.get_event_loop().run_in_executor(
+        response = await loop.run_in_executor(
             None, generate_response, messages
         )
 
@@ -292,7 +296,7 @@ async def on_message(message):
             print("  [Discord] Retrying without conversation history...")
             history[:] = [{"role": "user", "content": augmented_question}]
             messages = [{"role": "system", "content": system_with_memory}] + history
-            response = await asyncio.get_event_loop().run_in_executor(
+            response = await loop.run_in_executor(
                 None, generate_response, messages
             )
 
@@ -307,13 +311,15 @@ async def on_message(message):
         # Add assistant response to history (use clean version without RAG context)
         history.append({"role": "assistant", "content": response})
 
-        # Log to journal for persistent memory
-        journal_add(
-            user=str(message.author),
-            channel=channel_name,
-            question=question,
-            sources=source_ids if source_ids else None,
-            response_snippet=response[:150],
+        # Log to journal for persistent memory (non-blocking)
+        await loop.run_in_executor(
+            None, lambda: journal_add(
+                user=str(message.author),
+                channel=channel_name,
+                question=question,
+                sources=source_ids if source_ids else None,
+                response_snippet=response[:150],
+            )
         )
 
         # Append source citations
