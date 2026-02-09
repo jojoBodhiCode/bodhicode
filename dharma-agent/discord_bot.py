@@ -229,7 +229,7 @@ async def on_message(message):
 
     # Respond in DMs (no mention needed) or when @mentioned in a server
     is_dm = isinstance(message.channel, discord.DMChannel)
-    is_mentioned = client.user in message.mentions
+    is_mentioned = any(u.id == client.user.id for u in message.mentions)
 
     if not is_dm and not is_mentioned:
         return
