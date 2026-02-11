@@ -257,6 +257,74 @@ def moltbook_delete(cfg, endpoint):
         return {"error": "Invalid JSON response from Moltbook"}
 
 
+# ─── Prompt size guard ──────────────────────────────────────────────────────
+
+_cli_ctx_size = None  # cached from /props on first LLM call
+
+
+def _query_server_ctx_size(server_url):
+    """Query llama-server /props for context size. Returns int or None."""
+    try:
+        r = requests.get(f"{server_url}/props", timeout=5)
+        if r.status_code == 200:
+            return r.json().get("default_generation_settings", {}).get("n_ctx")
+    except Exception:
+        pass
+    return None
+
+
+def _trim_messages_cli(cfg, messages, max_tokens):
+    """
+    Ensure prompt + max_tokens fits within the server's context window.
+
+    Returns a (possibly trimmed) copy of messages. Does not mutate originals.
+    """
+    global _cli_ctx_size
+    if _cli_ctx_size is None:
+        if cfg.get("backend") == "llama-server":
+            url = normalize_url(cfg.get("llama_server_url", ""))
+            _cli_ctx_size = _query_server_ctx_size(url) or 4096
+        else:
+            _cli_ctx_size = 4096  # conservative default for Ollama
+        print(f"  Context window: {_cli_ctx_size} tokens")
+
+    max_prompt_tokens = _cli_ctx_size - max_tokens - 128
+    if max_prompt_tokens < 256:
+        max_prompt_tokens = 256
+
+    total = sum(len(m["content"]) // 4 + 1 for m in messages)
+    if total <= max_prompt_tokens:
+        return messages
+
+    # Make a mutable copy
+    messages = [dict(m) for m in messages]
+
+    # Truncate the longest user message (usually contains RAG context)
+    user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
+    if user_indices:
+        longest_idx = max(user_indices, key=lambda i: len(messages[i]["content"]))
+        content = messages[longest_idx]["content"]
+        overshoot_chars = (total - max_prompt_tokens) * 4 + 200
+        target_len = len(content) - overshoot_chars
+        if target_len > 200:
+            keep_start = int(target_len * 0.67)
+            keep_end = target_len - keep_start
+            messages[longest_idx]["content"] = (
+                content[:keep_start]
+                + "\n\n[... trimmed to fit context ...]\n\n"
+                + content[-keep_end:]
+            )
+            print(f"  Trimmed prompt to fit context ({_cli_ctx_size} tokens)")
+            return messages
+
+    # Drop all but system + last user message
+    if len(messages) > 2:
+        messages = [messages[0], messages[-1]]
+        print(f"  Dropped history to fit context ({_cli_ctx_size} tokens)")
+
+    return messages
+
+
 # ─── Ollama integration ─────────────────────────────────────────────────────
 
 def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT, max_tokens=1024):
@@ -276,6 +344,9 @@ def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT, max_tokens=102
     Returns:
         The assistant's response text, or None on error.
     """
+    # Guard: trim prompt to fit within context window
+    messages = _trim_messages_cli(cfg, messages, max_tokens)
+
     if cfg.get("backend") == "llama-server":
         cfg["llama_server_url"] = normalize_url(cfg.get("llama_server_url", ""))
         url = f"{cfg['llama_server_url']}/v1/chat/completions"

@@ -44,8 +44,9 @@ from deep_research import (
 
 CONFIG_FILE = Path.home() / ".config" / "dharma-agent" / "config.json"
 LLAMA_SERVER_URL = "http://127.0.0.1:8080"
-MAX_HISTORY = 2           # max messages per channel (keep small to fit 4096 context)
+MAX_HISTORY = 2           # max messages per channel (keep small for context)
 DISCORD_CHAR_LIMIT = 2000  # Discord message character limit
+DEFAULT_CTX_SIZE = 4096   # fallback if /props unavailable
 
 # ─── LLM lock & research state ──────────────────────────────────────────────
 
@@ -136,10 +137,93 @@ def format_source_ids(sources):
     return ids
 
 
+# ─── Prompt size guard ───────────────────────────────────────────────────────
+
+_server_ctx_size = None  # cached from /props on first LLM call
+
+
+def _get_server_ctx_size():
+    """Query llama-server /props for the actual context size. Cached after first call."""
+    global _server_ctx_size
+    if _server_ctx_size is not None:
+        return _server_ctx_size
+    try:
+        url = get_llama_url()
+        parsed = urlparse(url)
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+        conn.request("GET", "/props")
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+        if resp.status == 200:
+            data = json.loads(raw)
+            ctx = data.get("default_generation_settings", {}).get("n_ctx", DEFAULT_CTX_SIZE)
+            _server_ctx_size = ctx
+            print(f"  [LLM] Server context size: {ctx} tokens")
+            return ctx
+    except Exception:
+        pass
+    _server_ctx_size = DEFAULT_CTX_SIZE
+    print(f"  [LLM] Using default context size: {DEFAULT_CTX_SIZE} tokens")
+    return _server_ctx_size
+
+
+def _estimate_tokens(text):
+    """Rough token count (~4 chars per token for English text)."""
+    return len(text) // 4 + 1
+
+
+def _trim_messages_to_fit(messages, max_tokens):
+    """
+    Ensure prompt + max_tokens fits within the server's context window.
+
+    Returns a (possibly trimmed) copy of messages. Does not mutate originals.
+    """
+    ctx_size = _get_server_ctx_size()
+    max_prompt_tokens = ctx_size - max_tokens - 128  # safety margin
+    if max_prompt_tokens < 256:
+        max_prompt_tokens = 256
+
+    total = sum(_estimate_tokens(m["content"]) for m in messages)
+    if total <= max_prompt_tokens:
+        return messages
+
+    # Make a mutable copy
+    messages = [dict(m) for m in messages]
+
+    # Strategy 1: truncate the longest user message (usually contains RAG context)
+    user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
+    if user_indices:
+        longest_idx = max(user_indices, key=lambda i: len(messages[i]["content"]))
+        content = messages[longest_idx]["content"]
+        overshoot_chars = (total - max_prompt_tokens) * 4 + 200
+        target_len = len(content) - overshoot_chars
+        if target_len > 200:
+            keep_start = int(target_len * 0.67)
+            keep_end = target_len - keep_start
+            messages[longest_idx]["content"] = (
+                content[:keep_start]
+                + "\n\n[... trimmed to fit context ...]\n\n"
+                + content[-keep_end:]
+            )
+            print(f"  [LLM] Trimmed prompt to fit context ({ctx_size} tokens)")
+            return messages
+
+    # Strategy 2: drop all but system + last user message
+    if len(messages) > 2:
+        messages = [messages[0], messages[-1]]
+        print(f"  [LLM] Dropped history to fit context ({ctx_size} tokens)")
+
+    return messages
+
+
 # ─── LLM generation ──────────────────────────────────────────────────────────
 
 def generate_response(messages, max_tokens=768, temperature=TEMPERATURE_FACTUAL):
     """Send messages to llama-server and get a response."""
+    # Guard: trim prompt to fit within context window
+    messages = _trim_messages_to_fit(messages, max_tokens)
+
     url = get_llama_url()
     parsed = urlparse(url)
 
