@@ -12,8 +12,9 @@ Setup:
        set DISCORD_BOT_TOKEN=your-token-here
        python discord_bot.py
 
-The bot will respond only when @mentioned. It maintains per-channel
-conversation history for follow-up questions.
+The bot will respond only when @mentioned. It maintains per-user
+conversation history for follow-up questions. Commands (! prefixed)
+are restricted to DMs; in channels the bot only chats.
 """
 
 import http.client
@@ -51,9 +52,9 @@ DEFAULT_CTX_SIZE = 4096   # fallback if /props unavailable
 # ─── LLM lock & research state ──────────────────────────────────────────────
 
 llm_lock = asyncio.Lock()
-active_research = None     # DeepResearch instance or None
-research_task = None       # asyncio.Task or None
-research_channel = None    # Discord channel for research updates
+active_research = {}       # {user_id: DeepResearch}
+research_tasks = {}        # {user_id: asyncio.Task}
+research_channels = {}     # {user_id: discord.Channel}
 
 
 def load_config():
@@ -303,10 +304,8 @@ def split_message(text, limit=DISCORD_CHAR_LIMIT):
 
 # ─── Async LLM helpers ───────────────────────────────────────────────────────
 
-async def run_research_background(goal, channel, resume_session=None):
+async def run_research_background(goal, channel, user_id, resume_session=None):
     """Run deep research as a background asyncio task, posting updates to Discord."""
-    global active_research
-
     rag = get_rag()
     loop = asyncio.get_running_loop()
 
@@ -314,18 +313,19 @@ async def run_research_background(goal, channel, resume_session=None):
         """Blocking LLM call used inside run_in_executor."""
         return generate_response(messages, max_tokens, TEMPERATURE_CREATIVE)
 
-    # Resume or start fresh
+    # Resume or start fresh — per-user project directory
     if resume_session:
         session = resume_session
         session.setup_dirs()  # ensure dirs exist even if manually deleted
         start_step = session.current_step
     else:
-        session = DeepResearch(goal)
+        user_project_dir = PROJECTS_DIR / str(user_id) / slugify(goal)
+        session = DeepResearch(goal, project_dir=user_project_dir)
         session.setup_dirs()
         start_step = 0
 
     # Set active immediately so !research status works during planning
-    active_research = session
+    active_research[user_id] = session
 
     if resume_session:
         await channel.send(
@@ -463,7 +463,8 @@ async def run_research_background(goal, channel, resume_session=None):
         await channel.send("Research encountered an error and stopped.")
         print(f"  [Research] Error: {e}")
     finally:
-        active_research = None
+        active_research.pop(user_id, None)
+        research_tasks.pop(user_id, None)
 
 
 # ─── Discord Bot ──────────────────────────────────────────────────────────────
@@ -472,8 +473,8 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# Per-channel conversation history: {channel_id: [{"role": ..., "content": ...}]}
-channel_history = defaultdict(list)
+# Per-user conversation history: {user_id: [{"role": ..., "content": ...}]}
+user_history = defaultdict(list)
 
 
 @client.event
@@ -488,8 +489,6 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    global research_task, research_channel
-
     # Don't respond to ourselves
     if message.author == client.user:
         return
@@ -512,51 +511,61 @@ async def on_message(message):
         await message.reply("Ask me anything about Buddhism!")
         return
 
+    # Commands are DM-only; in channels the bot just chats
+    if question.startswith("!") and not is_dm:
+        await message.reply("Commands are available in DMs only. Send me a direct message!")
+        return
+
+    user_id = message.author.id
+
     # ─── Handle !research commands ───────────────────────────────────────
     if question.startswith("!research"):
         parts = question.split(None, 1)
         subcommand = parts[1] if len(parts) > 1 else ""
 
         if subcommand.lower() == "status":
-            if active_research:
+            session = active_research.get(user_id)
+            if session:
                 step_info = (
-                    f"Step {active_research.current_step + 1}/{len(active_research.steps)}"
-                    if active_research.steps else "planning"
+                    f"Step {session.current_step + 1}/{len(session.steps)}"
+                    if session.steps else "planning"
                 )
                 await message.reply(
-                    f"**Research Status:** {active_research.status}\n"
-                    f"**Goal:** {active_research.goal}\n"
+                    f"**Research Status:** {session.status}\n"
+                    f"**Goal:** {session.goal}\n"
                     f"**Progress:** {step_info}"
                 )
             else:
-                await message.reply("No active research session.")
+                await message.reply("You have no active research session.")
             return
 
         if subcommand.lower() == "stop":
-            if active_research:
-                active_research.status = "stopped"
-                await message.reply("Stopping research after current step completes...")
+            session = active_research.get(user_id)
+            if session:
+                session.status = "stopped"
+                await message.reply("Stopping your research after current step completes...")
             else:
-                await message.reply("No active research to stop.")
+                await message.reply("You have no active research to stop.")
             return
 
         if subcommand.lower().startswith("resume"):
-            if active_research:
-                await message.reply("A research session is already running.")
+            if active_research.get(user_id):
+                await message.reply("You already have a research session running.")
                 return
             # Resume: !research resume <goal-slug-or-partial>
             resume_arg = subcommand[len("resume"):].strip()
+            user_projects = PROJECTS_DIR / str(user_id)
             if not resume_arg:
-                # List available projects
-                if PROJECTS_DIR.exists():
+                # List available projects for this user
+                if user_projects.exists():
                     projects = [
-                        d.name for d in sorted(PROJECTS_DIR.iterdir())
+                        d.name for d in sorted(user_projects.iterdir())
                         if d.is_dir() and (d / "plan.md").exists()
                     ]
                     if projects:
                         listing = "\n".join(f"  - `{p}`" for p in projects[-10:])
                         await message.reply(
-                            f"**Available projects to resume:**\n{listing}\n\n"
+                            f"**Your projects to resume:**\n{listing}\n\n"
                             f"Use `!research resume <name>`"
                         )
                     else:
@@ -565,13 +574,13 @@ async def on_message(message):
                     await message.reply("No projects found to resume.")
                 return
 
-            # Find matching project
-            target_dir = PROJECTS_DIR / resume_arg
+            # Find matching project in this user's directory
+            target_dir = user_projects / resume_arg
             if not target_dir.exists():
-                # Try partial match
-                if PROJECTS_DIR.exists():
+                # Try partial match within user's projects
+                if user_projects.exists():
                     matches = [
-                        d for d in PROJECTS_DIR.iterdir()
+                        d for d in user_projects.iterdir()
                         if d.is_dir() and resume_arg.lower() in d.name.lower()
                     ]
                     if len(matches) == 1:
@@ -594,9 +603,11 @@ async def on_message(message):
                 await message.reply("That project is already complete.")
                 return
 
-            research_channel = message.channel
-            research_task = asyncio.create_task(
-                run_research_background(resumed.goal, message.channel, resume_session=resumed)
+            research_channels[user_id] = message.channel
+            research_tasks[user_id] = asyncio.create_task(
+                run_research_background(
+                    resumed.goal, message.channel, user_id, resume_session=resumed
+                )
             )
             return
 
@@ -611,17 +622,17 @@ async def on_message(message):
             )
             return
 
-        if active_research:
+        if active_research.get(user_id):
             await message.reply(
-                "A research session is already running. "
+                "You already have a research session running. "
                 "Use `!research stop` to cancel it first."
             )
             return
 
-        # Launch research as a background task
-        research_channel = message.channel
-        research_task = asyncio.create_task(
-            run_research_background(subcommand, message.channel)
+        # Launch research as a background task for this user
+        research_channels[user_id] = message.channel
+        research_tasks[user_id] = asyncio.create_task(
+            run_research_background(subcommand, message.channel, user_id)
         )
         return
 
@@ -957,7 +968,7 @@ async def on_message(message):
             "`!server` — LLM server health & info\n"
             "`!server slots` — Show slot statuses\n"
             "`!server clear` — Reset stuck server slots\n\n"
-            "Or just @mention me with a question about Buddhism!"
+            "*All commands are DM-only. @mention me in channels to chat!*"
         )
         return
 
@@ -988,8 +999,8 @@ async def on_message(message):
         else:
             augmented_question = question
 
-        # Get channel history and add new message
-        history = channel_history[message.channel.id]
+        # Get per-user history and add new message
+        history = user_history[user_id]
         history.append({"role": "user", "content": augmented_question})
 
         # Trim history (keep last N messages)
