@@ -25,6 +25,16 @@ from collections import defaultdict
 from pathlib import Path
 from urllib.parse import urlparse
 
+# Load .env file if present (no dependency on python-dotenv)
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    with open(_env_path, encoding="utf-8") as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 try:
     import discord
 except ImportError:
@@ -47,7 +57,7 @@ CONFIG_FILE = Path.home() / ".config" / "dharma-agent" / "config.json"
 LLAMA_SERVER_URL = "http://127.0.0.1:8080"
 MAX_HISTORY = 2           # max messages per channel (keep small for context)
 DISCORD_CHAR_LIMIT = 2000  # Discord message character limit
-DEFAULT_CTX_SIZE = 4096   # fallback if /props unavailable
+DEFAULT_CTX_SIZE = 8192   # fallback if /props unavailable
 
 # ─── LLM lock & research state ──────────────────────────────────────────────
 
@@ -872,7 +882,9 @@ async def on_message(message):
                 await message.reply("Unexpected response from /slots endpoint.")
                 return
 
+            # Try slot erase API (not all llama-server versions support this)
             cleared = 0
+            unsupported = False
             for slot in data:
                 slot_id = slot.get("id", 0)
                 s, _ = await loop.run_in_executor(
@@ -880,15 +892,61 @@ async def on_message(message):
                 )
                 if s and s < 300:
                     cleared += 1
+                elif s == 501:
+                    unsupported = True
+                    break
 
             # Also reset our cached context size so it gets re-queried
             global _server_ctx_size
             _server_ctx_size = None
 
-            await message.reply(
-                f"Cleared {cleared}/{len(data)} slots. "
-                f"Server should be responsive now."
-            )
+            if unsupported:
+                # Slot erase not supported — send a tiny dummy request to
+                # flush the pipeline and cancel any queued work
+                def _flush_server():
+                    try:
+                        body = json.dumps({
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "max_tokens": 1,
+                            "temperature": 0,
+                        }).encode("utf-8")
+                        conn = http.client.HTTPConnection(
+                            parsed.hostname, parsed.port, timeout=30
+                        )
+                        conn.request(
+                            "POST", "/v1/chat/completions",
+                            body=body,
+                            headers={
+                                "Content-Type": "application/json",
+                                "Content-Length": str(len(body)),
+                            },
+                        )
+                        resp = conn.getresponse()
+                        resp.read()
+                        conn.close()
+                        return True
+                    except Exception:
+                        return False
+
+                await message.reply(
+                    "Slot erase not supported by this server version. "
+                    "Sending flush request to cycle the pipeline..."
+                )
+                flushed = await loop.run_in_executor(None, _flush_server)
+                if flushed:
+                    await message.reply(
+                        "Flush complete. Server should be responsive. "
+                        "If still stuck, restart llama-server manually."
+                    )
+                else:
+                    await message.reply(
+                        "Flush failed. Restart llama-server manually."
+                    )
+            else:
+                await message.reply(
+                    f"Cleared {cleared}/{len(data)} slots. "
+                    f"Server should be responsive now."
+                )
             return
 
         if subcommand == "slots":
