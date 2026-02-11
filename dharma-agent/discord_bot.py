@@ -537,6 +537,203 @@ async def on_message(message):
         )
         return
 
+    # ─── Handle !journal commands ────────────────────────────────────────
+    if question.startswith("!journal"):
+        from journal import load_journal
+        parts = question.split(None, 1)
+        subcommand = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        entries = await asyncio.get_running_loop().run_in_executor(
+            None, load_journal
+        )
+
+        if subcommand == "clear":
+            from journal import save_journal
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: save_journal([])
+            )
+            await message.reply("Journal cleared.")
+            return
+
+        if subcommand.startswith("search"):
+            # !journal search <term>
+            term = subcommand[len("search"):].strip()
+            if not term:
+                await message.reply("Usage: `!journal search <term>`")
+                return
+            term_lower = term.lower()
+            matches = [
+                e for e in entries
+                if term_lower in e.get("topic", "").lower()
+                or term_lower in e.get("response", "").lower()
+                or term_lower in e.get("channel", "").lower()
+            ]
+            if not matches:
+                await message.reply(f"No journal entries matching '{term}'.")
+                return
+            lines = []
+            for e in matches[-10:]:
+                sources_str = f" [{', '.join(e['sources'])}]" if e.get("sources") else ""
+                lines.append(
+                    f"**{e['time']}** | {e['user']} in {e['channel']}\n"
+                    f"> {e['topic']}{sources_str}"
+                )
+            await message.reply(
+                f"**Journal Search** — '{term}' ({len(matches)} matches, "
+                f"showing last {min(10, len(matches))}):\n\n"
+                + "\n\n".join(lines)
+            )
+            return
+
+        # Default: show recent entries
+        count = 10
+        if subcommand.isdigit():
+            count = min(int(subcommand), 25)
+
+        if not entries:
+            await message.reply("Journal is empty.")
+            return
+
+        recent = entries[-count:]
+        lines = []
+        for e in recent:
+            sources_str = f" [{', '.join(e['sources'])}]" if e.get("sources") else ""
+            lines.append(
+                f"**{e['time']}** | {e['user']} in {e['channel']}\n"
+                f"> {e['topic']}{sources_str}"
+            )
+
+        await message.reply(
+            f"**Journal** ({len(entries)} total, showing last {len(recent)}):\n\n"
+            + "\n\n".join(lines)
+        )
+        return
+
+    # ─── Handle !kb commands ─────────────────────────────────────────────
+    if question.startswith("!kb") or question.startswith("!rag"):
+        parts = question.split(None, 1)
+        subcommand = parts[1].strip() if len(parts) > 1 else ""
+        loop = asyncio.get_running_loop()
+
+        rag = get_rag()
+        if rag is None:
+            await message.reply("Knowledge base is not available.")
+            return
+
+        if subcommand.lower().startswith("search"):
+            # !kb search <query>
+            query = subcommand[len("search"):].strip()
+            if not query:
+                await message.reply("Usage: `!kb search <query>`")
+                return
+
+            results = await loop.run_in_executor(
+                None, lambda: rag.search_direct(query, k=5)
+            )
+            if not results:
+                await message.reply(f"No results for '{query}'.")
+                return
+
+            lines = []
+            for r in results:
+                meta = r["metadata"]
+                text_id = meta.get("text_id", "?")
+                tradition = meta.get("tradition", "?")
+                sim = f"{r.get('similarity', 0):.2f}"
+                snippet = r["text"][:150].replace("\n", " ")
+                lines.append(
+                    f"**{text_id}** ({tradition}) — sim: {sim}\n"
+                    f"> {snippet}..."
+                )
+
+            await message.reply(
+                f"**KB Search** — '{query}' ({len(results)} results):\n\n"
+                + "\n\n".join(lines)
+            )
+            return
+
+        if subcommand.lower() == "traditions":
+            stats = await loop.run_in_executor(None, rag.get_stats)
+            traditions = stats.get("by_tradition", {})
+            if not traditions:
+                await message.reply("No tradition data available.")
+                return
+            lines = [f"  {t}: ~{c} chunks" for t, c in sorted(traditions.items())]
+            await message.reply(
+                f"**KB Traditions** ({stats['total_chunks']} total):\n"
+                + "\n".join(lines)
+            )
+            return
+
+        if subcommand.lower() == "types":
+            stats = await loop.run_in_executor(None, rag.get_stats)
+            types = stats.get("by_type", {})
+            if not types:
+                await message.reply("No type data available.")
+                return
+            lines = [f"  {t}: ~{c} chunks" for t, c in sorted(types.items())]
+            await message.reply(
+                f"**KB Text Types** ({stats['total_chunks']} total):\n"
+                + "\n".join(lines)
+            )
+            return
+
+        # Default: overview stats
+        stats = await loop.run_in_executor(None, rag.get_stats)
+        total = stats["total_chunks"]
+        if total == 0:
+            await message.reply("Knowledge base is empty. Ingest texts via the CLI menu [9].")
+            return
+
+        msg = f"**Knowledge Base Overview**\n"
+        msg += f"Total chunks: **{total}**\n"
+        msg += f"Embedding model: {stats.get('embedding_model', '?')}\n"
+
+        traditions = stats.get("by_tradition", {})
+        if traditions:
+            msg += "\n**By tradition:**\n"
+            for t, c in sorted(traditions.items(), key=lambda x: -x[1]):
+                msg += f"  {t}: ~{c}\n"
+
+        collections = stats.get("by_collection", {})
+        if collections:
+            top_collections = sorted(collections.items(), key=lambda x: -x[1])[:8]
+            msg += "\n**Top collections:**\n"
+            for c, count in top_collections:
+                msg += f"  {c}: ~{count}\n"
+
+        types = stats.get("by_type", {})
+        if types:
+            msg += "\n**By type:**\n"
+            for t, c in sorted(types.items(), key=lambda x: -x[1]):
+                msg += f"  {t}: ~{c}\n"
+
+        await message.reply(msg)
+        return
+
+    # ─── Handle !help command ────────────────────────────────────────────
+    if question.strip() == "!help":
+        await message.reply(
+            "**Dharma Scholar Commands:**\n\n"
+            "**Research:**\n"
+            "`!research <goal>` — Start a deep research session\n"
+            "`!research status` — Check research progress\n"
+            "`!research stop` — Stop current session\n"
+            "`!research resume` — Resume interrupted sessions\n\n"
+            "**Journal (memory):**\n"
+            "`!journal` — Show last 10 journal entries\n"
+            "`!journal <N>` — Show last N entries (max 25)\n"
+            "`!journal search <term>` — Search journal entries\n"
+            "`!journal clear` — Clear all journal entries\n\n"
+            "**Knowledge Base:**\n"
+            "`!kb` — KB overview (chunks, traditions, types)\n"
+            "`!kb search <query>` — Search the knowledge base\n"
+            "`!kb traditions` — Breakdown by tradition\n"
+            "`!kb types` — Breakdown by text type\n\n"
+            "Or just @mention me with a question about Buddhism!"
+        )
+        return
+
     # ─── Regular message handling ────────────────────────────────────────
 
     channel_name = "DM" if is_dm else f"#{message.channel.name}"
