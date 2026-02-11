@@ -36,7 +36,8 @@ from prompts import SYSTEM_PROMPT, TEMPERATURE_FACTUAL, TEMPERATURE_CREATIVE
 from journal import add_entry as journal_add, format_for_prompt as journal_prompt
 from deep_research import (
     DeepResearch, plan_research, execute_step,
-    synthesize_research, index_research_notes, PROJECTS_DIR,
+    synthesize_research, index_research_notes, run_deepening_pass,
+    identify_gaps, slugify, PROJECTS_DIR,
 )
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -214,50 +215,44 @@ def split_message(text, limit=DISCORD_CHAR_LIMIT):
 
 # ─── Async LLM helpers ───────────────────────────────────────────────────────
 
-async def generate_with_lock(messages, max_tokens=768):
-    """Async LLM wrapper that serializes access via the lock."""
-    async with llm_lock:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, lambda: generate_response(messages, max_tokens, TEMPERATURE_CREATIVE)
-        )
-
-
-async def run_research_background(goal, channel):
+async def run_research_background(goal, channel, resume_session=None):
     """Run deep research as a background asyncio task, posting updates to Discord."""
     global active_research
 
     rag = get_rag()
-    session = DeepResearch(goal)
-    session.setup_dirs()
+    loop = asyncio.get_running_loop()
+
+    def sync_llm(messages, max_tokens=1024):
+        """Blocking LLM call used inside run_in_executor."""
+        return generate_response(messages, max_tokens, TEMPERATURE_CREATIVE)
+
+    # Resume or start fresh
+    if resume_session:
+        session = resume_session
+        session.setup_dirs()  # ensure dirs exist even if manually deleted
+        start_step = session.current_step
+    else:
+        session = DeepResearch(goal)
+        session.setup_dirs()
+        start_step = 0
+
+    # Set active immediately so !research status works during planning
     active_research = session
 
-    try:
+    if resume_session:
+        await channel.send(
+            f"**Resuming Deep Research**\n"
+            f"Goal: {goal}\n"
+            f"Picking up at step {start_step + 1}/{len(session.steps)}"
+        )
+    else:
         await channel.send(
             f"**Deep Research Started**\n"
             f"Goal: {goal}\n"
             f"Planning research steps..."
         )
 
-        # Planning phase — llm_func for deep_research uses the lock
-        def sync_llm(messages, max_tokens=1024):
-            """Blocking LLM call used inside run_in_executor."""
-            return generate_response(messages, max_tokens, TEMPERATURE_CREATIVE)
-
-        async def async_llm(messages, max_tokens=1024):
-            """Async LLM wrapper with lock for research steps."""
-            async with llm_lock:
-                loop = asyncio.get_event_loop()
-                return await loop.run_in_executor(
-                    None, lambda: sync_llm(messages, max_tokens)
-                )
-
-        # Plan — run in executor since plan_research is sync
-        loop = asyncio.get_event_loop()
-
-        # We need to make deep_research functions work with our async llm.
-        # Since they expect a sync callable, we'll run each phase with
-        # the lock held, then release between phases.
+        # Planning phase
         async with llm_lock:
             steps = await loop.run_in_executor(
                 None, lambda: plan_research(session, rag, sync_llm)
@@ -268,16 +263,18 @@ async def run_research_background(goal, channel):
         )
         await channel.send(f"**Research Plan** ({len(steps)} steps):\n{plan_summary}")
 
-        # Research loop
-        for i in range(len(steps)):
+    try:
+        # Research loop (starts from start_step for resumed sessions)
+        i = start_step
+        while i < len(session.steps):
             if session.status == "stopped":
                 await channel.send("Research stopped by user.")
                 break
 
             await asyncio.sleep(2)  # yield to Discord event loop
 
-            title = steps[i][0]
-            await channel.send(f"Step {i+1}/{len(steps)}: **{title}**...")
+            title = session.steps[i][0]
+            await channel.send(f"Step {i+1}/{len(session.steps)}: **{title}**...")
 
             async with llm_lock:
                 notes = await loop.run_in_executor(
@@ -285,10 +282,13 @@ async def run_research_background(goal, channel):
                 )
 
             if notes:
-                preview = notes[:300].replace('\n', ' ')
-                await channel.send(f"Step {i+1} complete. Preview: {preview[:200]}...")
+                preview = notes[:200].replace('\n', ' ')
+                await channel.send(f"Step {i+1} complete. Preview: {preview}...")
             else:
                 await channel.send(f"Step {i+1} had an issue, continuing...")
+
+            # Dynamic plan revision may have added steps — recheck length
+            i += 1
 
         # Synthesis
         if session.status != "stopped":
@@ -298,10 +298,52 @@ async def run_research_background(goal, channel):
                     None, lambda: synthesize_research(session, sync_llm)
                 )
 
-            if synthesis:
-                await channel.send("Final document saved.")
-            else:
+            if not synthesis:
                 await channel.send("Synthesis had an issue.")
+
+            # Iterative deepening (1 pass max, per-step locking so
+            # Discord messages can interleave between gap steps)
+            if synthesis and session.critique and session.iteration == 0:
+                await channel.send(
+                    "Checking for gaps worth a deeper look..."
+                )
+                async with llm_lock:
+                    gaps = await loop.run_in_executor(
+                        None, lambda: identify_gaps(session, sync_llm)
+                    )
+                if gaps:
+                    session.iteration = 1
+                    session.status = "deepening"
+                    session.gaps = gaps
+                    original_steps = list(session.steps)
+                    session.steps = gaps
+                    await channel.send(
+                        f"Found {len(gaps)} gaps to investigate..."
+                    )
+                    for gi in range(len(gaps)):
+                        if session.status == "stopped":
+                            break
+                        await asyncio.sleep(2)
+                        await channel.send(
+                            f"Deepening {gi+1}/{len(gaps)}: **{gaps[gi][0]}**..."
+                        )
+                        async with llm_lock:
+                            await loop.run_in_executor(
+                                None, lambda idx=gi: execute_step(
+                                    session, idx, rag, sync_llm
+                                )
+                            )
+                    session.steps = original_steps + gaps
+                    # Re-synthesize with all notes
+                    await channel.send("Re-synthesizing with deepened research...")
+                    async with llm_lock:
+                        await loop.run_in_executor(
+                            None, lambda: synthesize_research(session, sync_llm)
+                        )
+                    await channel.send("Deepening pass complete, final document updated.")
+                else:
+                    await channel.send("Research is solid — no deepening needed.")
+                session.status = "done"
 
             # Index into KB
             if rag:
@@ -310,12 +352,22 @@ async def run_research_background(goal, channel):
                 )
                 await channel.send(f"Indexed {count} chunks into the knowledge base.")
 
+            # Send final.md as a file attachment
+            final_path = session.project_dir / "final.md"
+            if final_path.exists():
+                await channel.send(
+                    "**Here's the final document:**",
+                    file=discord.File(str(final_path), filename="final.md"),
+                )
+
         # Summary
         files_list = "\n".join(f"  - {f.name}" for f in session.note_files)
         await channel.send(
             f"**Research Complete**\n"
             f"{len(session.note_files)} files generated:\n{files_list}"
         )
+
+        session.status = "done"
 
     except asyncio.CancelledError:
         await channel.send("Research task was cancelled.")
@@ -400,13 +452,74 @@ async def on_message(message):
                 await message.reply("No active research to stop.")
             return
 
+        if subcommand.lower().startswith("resume"):
+            if active_research:
+                await message.reply("A research session is already running.")
+                return
+            # Resume: !research resume <goal-slug-or-partial>
+            resume_arg = subcommand[len("resume"):].strip()
+            if not resume_arg:
+                # List available projects
+                if PROJECTS_DIR.exists():
+                    projects = [
+                        d.name for d in sorted(PROJECTS_DIR.iterdir())
+                        if d.is_dir() and (d / "plan.md").exists()
+                    ]
+                    if projects:
+                        listing = "\n".join(f"  - `{p}`" for p in projects[-10:])
+                        await message.reply(
+                            f"**Available projects to resume:**\n{listing}\n\n"
+                            f"Use `!research resume <name>`"
+                        )
+                    else:
+                        await message.reply("No projects found to resume.")
+                else:
+                    await message.reply("No projects found to resume.")
+                return
+
+            # Find matching project
+            target_dir = PROJECTS_DIR / resume_arg
+            if not target_dir.exists():
+                # Try partial match
+                if PROJECTS_DIR.exists():
+                    matches = [
+                        d for d in PROJECTS_DIR.iterdir()
+                        if d.is_dir() and resume_arg.lower() in d.name.lower()
+                    ]
+                    if len(matches) == 1:
+                        target_dir = matches[0]
+                    elif len(matches) > 1:
+                        listing = "\n".join(f"  - `{d.name}`" for d in matches)
+                        await message.reply(
+                            f"Multiple matches:\n{listing}\n\nBe more specific."
+                        )
+                        return
+                    else:
+                        await message.reply(f"No project matching '{resume_arg}' found.")
+                        return
+
+            resumed = DeepResearch.resume(target_dir)
+            if not resumed:
+                await message.reply("Could not parse that project's plan.md.")
+                return
+            if resumed.status == "done":
+                await message.reply("That project is already complete.")
+                return
+
+            research_channel = message.channel
+            research_task = asyncio.create_task(
+                run_research_background(resumed.goal, message.channel, resume_session=resumed)
+            )
+            return
+
         # Start new research: !research <goal>
         if not subcommand:
             await message.reply(
                 "**Deep Research Commands:**\n"
                 "`!research <goal>` — Start a research session\n"
                 "`!research status` — Check progress\n"
-                "`!research stop` — Stop current session"
+                "`!research stop` — Stop current session\n"
+                "`!research resume` — List / resume interrupted sessions"
             )
             return
 
@@ -432,7 +545,7 @@ async def on_message(message):
     # Show typing indicator while we generate
     async with message.channel.typing():
         # RAG retrieval (run in executor to avoid blocking the event loop)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         context, sources = await loop.run_in_executor(
             None, rag_retrieve, question
         )

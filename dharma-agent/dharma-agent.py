@@ -1516,6 +1516,12 @@ def action_auto_mode(cfg):
 
 def action_deep_research(cfg):
     """Run an autonomous deep research session from the CLI."""
+    from deep_research import (
+        DeepResearch, plan_research, execute_step,
+        synthesize_research, index_research_notes, run_deepening_pass,
+        PROJECTS_DIR,
+    )
+
     print("\n  ╔══════════════════════════════════════════════════════════╗")
     print("  ║       🔬  Deep Research Mode  🔬                        ║")
     print("  ╚══════════════════════════════════════════════════════════╝")
@@ -1524,71 +1530,126 @@ def action_deep_research(cfg):
     print("  plan, research, write notes, and synthesize a final document.")
     print("  Notes are saved as markdown and indexed into the knowledge base.")
     print()
+    print("  [n] New research session")
+    print("  [r] Resume an interrupted session")
+    print("  [x] Back")
+    choice = input("  Choice: ").strip().lower()
 
-    goal = input("  Research goal: ").strip()
-    if not goal:
-        print("  No goal provided. Returning to menu.")
+    if choice == "x" or not choice:
         return
 
-    steps_input = input("  Max research steps [8]: ").strip()
-    max_steps = int(steps_input) if steps_input.isdigit() and int(steps_input) > 0 else 8
-
-    from deep_research import DeepResearch, plan_research, execute_step, synthesize_research, index_research_notes
-
     rag = get_rag()
-    session = DeepResearch(goal, max_steps=max_steps)
-    session.setup_dirs()
-
-    print(f"\n  Project directory: {session.project_dir}")
-    print(f"  Planning research...\n")
 
     # Sync LLM wrapper
     def llm_func(messages, max_tokens=1024):
         return generate_chat(cfg, messages, temperature=TEMPERATURE_CREATIVE, max_tokens=max_tokens)
 
-    try:
-        # Phase 1: Planning
+    if choice == "r":
+        # Resume mode
+        if not PROJECTS_DIR.exists():
+            print("  No projects found.")
+            return
+        projects = [
+            d for d in sorted(PROJECTS_DIR.iterdir())
+            if d.is_dir() and (d / "plan.md").exists()
+        ]
+        incomplete = []
+        for p in projects:
+            if not (p / "final.md").exists():
+                incomplete.append(p)
+
+        if not incomplete:
+            print("  No interrupted projects found (all have final.md).")
+            return
+
+        print(f"\n  Interrupted projects:")
+        for i, p in enumerate(incomplete, 1):
+            notes_count = len(list((p / "notes").glob("*.md"))) if (p / "notes").exists() else 0
+            print(f"    [{i}] {p.name}  ({notes_count} notes so far)")
+
+        pick = input(f"  Resume which? [1-{len(incomplete)}]: ").strip()
+        if not pick.isdigit() or int(pick) < 1 or int(pick) > len(incomplete):
+            print("  Invalid choice.")
+            return
+
+        session = DeepResearch.resume(incomplete[int(pick) - 1])
+        if not session:
+            print("  Could not parse that project's plan.")
+            return
+
+        print(f"\n  Resuming: {session.goal}")
+        print(f"  Picking up at step {session.current_step + 1}/{len(session.steps)}\n")
+        start_step = session.current_step
+
+    else:
+        # New session
+        goal = input("  Research goal: ").strip()
+        if not goal:
+            print("  No goal provided.")
+            return
+
+        steps_input = input("  Max research steps [8]: ").strip()
+        max_steps = int(steps_input) if steps_input.isdigit() and int(steps_input) > 0 else 8
+
+        session = DeepResearch(goal, max_steps=max_steps)
+        session.setup_dirs()
+        start_step = 0
+
+        print(f"\n  Project directory: {session.project_dir}")
+        print(f"  Planning research...\n")
+
         steps = plan_research(session, rag, llm_func)
         print(f"\n  📋 Research plan ({len(steps)} steps):")
         for i, (title, desc) in enumerate(steps, 1):
             print(f"     {i}. {title}")
         print()
 
-        # Phase 2: Research loop
-        for i in range(len(steps)):
-            title = steps[i][0]
-            print(f"  ── Step {i + 1}/{len(steps)}: {title} ──\n")
+    try:
+        # Research loop (supports dynamic step additions)
+        i = start_step
+        while i < len(session.steps):
+            title = session.steps[i][0]
+            print(f"  ── Step {i + 1}/{len(session.steps)}: {title} ──\n")
 
             notes = execute_step(session, i, rag, llm_func)
             if notes:
-                # Show a brief preview
                 preview = notes[:200].replace('\n', ' ')
                 print(f"  ✅ Notes saved. Preview: {preview}...\n")
             else:
                 print(f"  ⚠️  Step failed, continuing...\n")
 
-            time.sleep(2)  # brief pause between steps
+            time.sleep(2)
+            i += 1
 
-        # Phase 3: Synthesis
+        # Synthesis
         print(f"\n  📝 Synthesizing research...\n")
         synthesis = synthesize_research(session, llm_func)
         if synthesis:
-            print(f"  ✅ Final document saved: {session.project_dir / 'final.md'}\n")
+            print(f"  ✅ Final document saved.\n")
         else:
             print(f"  ⚠️  Synthesis failed.\n")
 
-        # Phase 4: Index into KB
+        # Iterative deepening
+        if synthesis and session.critique:
+            print(f"  🔍 Checking for gaps worth investigating...\n")
+            deepened = run_deepening_pass(session, rag, llm_func)
+            if deepened:
+                print(f"  ✅ Deepening pass complete: {len(session.gaps)} gaps addressed.\n")
+            else:
+                print(f"  Research is solid — no deepening needed.\n")
+
+        # Index into KB
         if rag:
             print(f"  📚 Indexing notes into knowledge base...")
             count = index_research_notes(session, rag)
             print(f"  ✅ Indexed {count} chunks.\n")
 
     except KeyboardInterrupt:
-        print("\n\n  Deep research stopped.")
+        print("\n\n  Deep research stopped. Use [r] next time to resume.")
 
     # Summary
     print(f"\n  ═══ Research Complete ═══")
-    print(f"  Goal: {goal}")
+    print(f"  Goal: {session.goal}")
     print(f"  Project: {session.project_dir}")
     print(f"  Files generated:")
     for f in session.note_files:
