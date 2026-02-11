@@ -845,8 +845,17 @@ async def on_message(message):
         loop = asyncio.get_running_loop()
 
         if subcommand in ("clear", "reset"):
+            await message.reply("Enter override code with `!server clear <code>`.")
+            return
+
+        if subcommand.startswith(("clear ", "reset ")):
+            code = subcommand.split(None, 1)[1].strip()
+            expected = os.environ.get("DHARMA_ADMIN_CODE", "")
+            if not expected or code != expected:
+                await message.reply("Invalid override code.")
+                return
             # Try to erase all active slots via /slots/{id}?action=erase
-            await message.reply("Attempting to clear server slots...")
+            await message.reply("Override accepted. Clearing server slots...")
             status, data = await loop.run_in_executor(None, _server_get, "/slots")
             if status is None:
                 await message.reply(f"Could not reach server: {data}")
@@ -940,7 +949,7 @@ async def on_message(message):
             busy = sum(1 for s in slots if s.get("state") == 1)
             msg += f"Slots: {len(slots)} total ({idle} idle, {busy} busy)\n"
             if busy > 0:
-                msg += "\nUse `!server clear` to reset stuck slots."
+                msg += "\nUse `!server clear <code>` to reset stuck slots."
 
         await message.reply(msg)
         return
@@ -967,7 +976,7 @@ async def on_message(message):
             "**Server:**\n"
             "`!server` — LLM server health & info\n"
             "`!server slots` — Show slot statuses\n"
-            "`!server clear` — Reset stuck server slots\n\n"
+            "`!server clear <code>` — Reset stuck server slots\n\n"
             "*All commands are DM-only. @mention me in channels to chat!*"
         )
         return

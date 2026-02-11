@@ -44,6 +44,10 @@ dharma-agent/finetune/outputs/
 # Config (contains API keys)
 # Users create their own via setup wizard
 
+# Environment secrets
+.env
+dharma-agent/.env
+
 # OS files
 Thumbs.db
 Desktop.ini
