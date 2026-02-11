@@ -236,7 +236,6 @@ async def run_research_background(goal, channel):
         await channel.send(
             f"**Deep Research Started**\n"
             f"Goal: {goal}\n"
-            f"Project: `{session.project_dir}`\n"
             f"Planning research steps..."
         )
 
@@ -300,9 +299,7 @@ async def run_research_background(goal, channel):
                 )
 
             if synthesis:
-                await channel.send(
-                    f"Final document saved: `{session.project_dir / 'final.md'}`"
-                )
+                await channel.send("Final document saved.")
             else:
                 await channel.send("Synthesis had an issue.")
 
@@ -314,17 +311,16 @@ async def run_research_background(goal, channel):
                 await channel.send(f"Indexed {count} chunks into the knowledge base.")
 
         # Summary
-        files_list = "\n".join(f"  - `{f.name}`" for f in session.note_files)
+        files_list = "\n".join(f"  - {f.name}" for f in session.note_files)
         await channel.send(
             f"**Research Complete**\n"
-            f"Project: `{session.project_dir}`\n"
-            f"Files:\n{files_list}"
+            f"{len(session.note_files)} files generated:\n{files_list}"
         )
 
     except asyncio.CancelledError:
         await channel.send("Research task was cancelled.")
     except Exception as e:
-        await channel.send(f"Research error: {e}")
+        await channel.send("Research encountered an error and stopped.")
         print(f"  [Research] Error: {e}")
     finally:
         active_research = None
@@ -390,8 +386,7 @@ async def on_message(message):
                 await message.reply(
                     f"**Research Status:** {active_research.status}\n"
                     f"**Goal:** {active_research.goal}\n"
-                    f"**Progress:** {step_info}\n"
-                    f"**Project:** `{active_research.project_dir}`"
+                    f"**Progress:** {step_info}"
                 )
             else:
                 await message.reply("No active research session.")
