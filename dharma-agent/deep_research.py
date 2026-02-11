@@ -30,6 +30,9 @@ from pathlib import Path
 from prompts import SYSTEM_PROMPT, TEMPERATURE_CREATIVE, TEMPERATURE_FACTUAL
 from journal import add_entry as journal_add, format_for_prompt as journal_prompt
 
+# Lighter system prompt for research — strips the examples section to save ~500 tokens
+_RESEARCH_SYSTEM_PROMPT = SYSTEM_PROMPT.split("## Examples")[0].rstrip() if "## Examples" in SYSTEM_PROMPT else SYSTEM_PROMPT
+
 # Wikipedia fallback (lazy-loaded, graceful if unavailable)
 _wiki_available = None
 
@@ -48,6 +51,8 @@ def _get_wiki_lookup():
 
 # Minimum RAG source count before we consider Wikipedia fallback
 RAG_THIN_THRESHOLD = 2
+# Cap RAG context injected into prompts (chars) to prevent slow prompt processing
+MAX_RAG_CONTEXT_CHARS = 3000
 
 # Project output lives under the config dir
 CONFIG_DIR = Path.home() / ".config" / "dharma-agent"
@@ -286,7 +291,7 @@ def _build_wiki_context(query, max_articles=3):
         return "", []
 
 
-def _build_dual_rag_context(goal, step_title, step_description, rag, k=4):
+def _build_dual_rag_context(goal, step_title, step_description, rag, k=3):
     """
     Two RAG queries per step for broader coverage, plus Wikipedia fallback.
 
@@ -300,7 +305,7 @@ def _build_dual_rag_context(goal, step_title, step_description, rag, k=4):
     context1, ids1 = _build_rag_context(f"{step_title}: {step_description}", rag, k=k)
 
     # Broader query connecting step to goal
-    context2, ids2 = _build_rag_context(f"{goal} — {step_title}", rag, k=3)
+    context2, ids2 = _build_rag_context(f"{goal} — {step_title}", rag, k=2)
 
     # Merge, dedup by source ID
     all_ids = list(ids1)
@@ -334,6 +339,10 @@ def _build_dual_rag_context(goal, step_title, step_description, rag, k=4):
             wp_id = f"WP:{url.split('/wiki/')[-1]}" if "/wiki/" in url else url
             if wp_id not in all_ids:
                 all_ids.append(wp_id)
+
+    # Cap total context size to avoid slow prompt processing
+    if len(combined) > MAX_RAG_CONTEXT_CHARS:
+        combined = combined[:MAX_RAG_CONTEXT_CHARS] + "\n\n[... additional context trimmed ...]"
 
     return combined, all_ids
 
@@ -435,7 +444,7 @@ def plan_research(session, rag, llm_func):
 
     # Include journal memory for continuity
     journal_context = journal_prompt()
-    system = SYSTEM_PROMPT
+    system = _RESEARCH_SYSTEM_PROMPT
     if journal_context:
         system += "\n\n" + journal_context
 
@@ -543,7 +552,7 @@ def execute_step(session, step_num, rag, llm_func):
     )
 
     journal_context = journal_prompt()
-    system = SYSTEM_PROMPT
+    system = _RESEARCH_SYSTEM_PROMPT
     if journal_context:
         system += "\n\n" + journal_context
 
@@ -640,7 +649,7 @@ def synthesize_research(session, llm_func):
     )
 
     journal_context = journal_prompt()
-    system = SYSTEM_PROMPT
+    system = _RESEARCH_SYSTEM_PROMPT
     if journal_context:
         system += "\n\n" + journal_context
 

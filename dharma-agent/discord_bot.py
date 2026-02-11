@@ -230,15 +230,8 @@ def _trim_messages_to_fit(messages, max_tokens):
 
 # ─── LLM generation ──────────────────────────────────────────────────────────
 
-def generate_response(messages, max_tokens=768, temperature=TEMPERATURE_FACTUAL):
-    """Send messages to llama-server and get a response."""
-    # Guard: cap max_tokens so at least half the context is available for prompt
-    ctx_size = _get_server_ctx_size()
-    max_tokens = min(max_tokens, ctx_size // 2)
-
-    # Guard: trim prompt to fit within context window
-    messages = _trim_messages_to_fit(messages, max_tokens)
-
+def _llm_post(messages, max_tokens, temperature, timeout=300):
+    """Low-level HTTP POST to llama-server. Returns response text or None."""
     url = get_llama_url()
     parsed = urlparse(url)
 
@@ -250,32 +243,55 @@ def generate_response(messages, max_tokens=768, temperature=TEMPERATURE_FACTUAL)
         "stream": False,
     }).encode("utf-8")
 
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    conn.request(
+        "POST", "/v1/chat/completions",
+        body=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(payload)),
+        },
+    )
+    resp = conn.getresponse()
+    raw = resp.read()
+    conn.close()
+    data = json.loads(raw)
+
+    if "choices" not in data:
+        error_msg = data.get("error", {})
+        if isinstance(error_msg, dict):
+            error_msg = error_msg.get("message", str(data))
+        print(f"  [LLM] Server error: {error_msg}")
+        return None
+
+    return data["choices"][0]["message"]["content"]
+
+
+def generate_response(messages, max_tokens=768, temperature=TEMPERATURE_FACTUAL):
+    """Send messages to llama-server with automatic retry on timeout."""
+    # Guard: cap max_tokens so at least half the context is available for prompt
+    ctx_size = _get_server_ctx_size()
+    max_tokens = min(max_tokens, ctx_size // 2)
+
+    # Guard: trim prompt to fit within context window
+    messages = _trim_messages_to_fit(messages, max_tokens)
+
+    # First attempt — 5 minute timeout
     try:
-        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=600)
-        conn.request(
-            "POST", "/v1/chat/completions",
-            body=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Content-Length": str(len(payload)),
-            },
-        )
-        resp = conn.getresponse()
-        raw = resp.read()
-        conn.close()
-        data = json.loads(raw)
-
-        if "choices" not in data:
-            # llama-server returned an error (likely context overflow)
-            error_msg = data.get("error", {})
-            if isinstance(error_msg, dict):
-                error_msg = error_msg.get("message", str(data))
-            print(f"  [LLM] Server error: {error_msg}")
-            return None
-
-        return data["choices"][0]["message"]["content"]
+        return _llm_post(messages, max_tokens, temperature, timeout=300)
     except Exception as e:
-        print(f"  [LLM] Generation error: {e}")
+        print(f"  [LLM] Attempt 1 failed: {e}")
+
+    # Retry — strip to system + last user message, halve max_tokens
+    print("  [LLM] Retrying with reduced prompt...")
+    if len(messages) > 2:
+        messages = [messages[0], messages[-1]]
+    retry_tokens = min(max_tokens, 512)
+
+    try:
+        return _llm_post(messages, retry_tokens, temperature, timeout=180)
+    except Exception as e:
+        print(f"  [LLM] Attempt 2 failed: {e}")
         return None
 
 
