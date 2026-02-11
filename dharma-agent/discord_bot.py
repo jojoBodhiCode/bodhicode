@@ -32,8 +32,12 @@ except ImportError:
 
 import asyncio
 
-from prompts import SYSTEM_PROMPT, TEMPERATURE_FACTUAL
+from prompts import SYSTEM_PROMPT, TEMPERATURE_FACTUAL, TEMPERATURE_CREATIVE
 from journal import add_entry as journal_add, format_for_prompt as journal_prompt
+from deep_research import (
+    DeepResearch, plan_research, execute_step,
+    synthesize_research, index_research_notes, PROJECTS_DIR,
+)
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -41,6 +45,13 @@ CONFIG_FILE = Path.home() / ".config" / "dharma-agent" / "config.json"
 LLAMA_SERVER_URL = "http://127.0.0.1:8080"
 MAX_HISTORY = 2           # max messages per channel (keep small to fit 4096 context)
 DISCORD_CHAR_LIMIT = 2000  # Discord message character limit
+
+# ─── LLM lock & research state ──────────────────────────────────────────────
+
+llm_lock = asyncio.Lock()
+active_research = None     # DeepResearch instance or None
+research_task = None       # asyncio.Task or None
+research_channel = None    # Discord channel for research updates
 
 
 def load_config():
@@ -126,16 +137,16 @@ def format_source_ids(sources):
 
 # ─── LLM generation ──────────────────────────────────────────────────────────
 
-def generate_response(messages):
+def generate_response(messages, max_tokens=768, temperature=TEMPERATURE_FACTUAL):
     """Send messages to llama-server and get a response."""
     url = get_llama_url()
     parsed = urlparse(url)
 
     payload = json.dumps({
         "messages": messages,
-        "temperature": TEMPERATURE_FACTUAL,
+        "temperature": temperature,
         "top_p": 0.9,
-        "max_tokens": 768,
+        "max_tokens": max_tokens,
         "stream": False,
     }).encode("utf-8")
 
@@ -201,6 +212,124 @@ def split_message(text, limit=DISCORD_CHAR_LIMIT):
     return chunks
 
 
+# ─── Async LLM helpers ───────────────────────────────────────────────────────
+
+async def generate_with_lock(messages, max_tokens=768):
+    """Async LLM wrapper that serializes access via the lock."""
+    async with llm_lock:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, lambda: generate_response(messages, max_tokens, TEMPERATURE_CREATIVE)
+        )
+
+
+async def run_research_background(goal, channel):
+    """Run deep research as a background asyncio task, posting updates to Discord."""
+    global active_research
+
+    rag = get_rag()
+    session = DeepResearch(goal)
+    session.setup_dirs()
+    active_research = session
+
+    try:
+        await channel.send(
+            f"**Deep Research Started**\n"
+            f"Goal: {goal}\n"
+            f"Project: `{session.project_dir}`\n"
+            f"Planning research steps..."
+        )
+
+        # Planning phase — llm_func for deep_research uses the lock
+        def sync_llm(messages, max_tokens=1024):
+            """Blocking LLM call used inside run_in_executor."""
+            return generate_response(messages, max_tokens, TEMPERATURE_CREATIVE)
+
+        async def async_llm(messages, max_tokens=1024):
+            """Async LLM wrapper with lock for research steps."""
+            async with llm_lock:
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    None, lambda: sync_llm(messages, max_tokens)
+                )
+
+        # Plan — run in executor since plan_research is sync
+        loop = asyncio.get_event_loop()
+
+        # We need to make deep_research functions work with our async llm.
+        # Since they expect a sync callable, we'll run each phase with
+        # the lock held, then release between phases.
+        async with llm_lock:
+            steps = await loop.run_in_executor(
+                None, lambda: plan_research(session, rag, sync_llm)
+            )
+
+        plan_summary = "\n".join(
+            f"{i+1}. **{t}**" for i, (t, _) in enumerate(steps)
+        )
+        await channel.send(f"**Research Plan** ({len(steps)} steps):\n{plan_summary}")
+
+        # Research loop
+        for i in range(len(steps)):
+            if session.status == "stopped":
+                await channel.send("Research stopped by user.")
+                break
+
+            await asyncio.sleep(2)  # yield to Discord event loop
+
+            title = steps[i][0]
+            await channel.send(f"Step {i+1}/{len(steps)}: **{title}**...")
+
+            async with llm_lock:
+                notes = await loop.run_in_executor(
+                    None, lambda idx=i: execute_step(session, idx, rag, sync_llm)
+                )
+
+            if notes:
+                preview = notes[:300].replace('\n', ' ')
+                await channel.send(f"Step {i+1} complete. Preview: {preview[:200]}...")
+            else:
+                await channel.send(f"Step {i+1} had an issue, continuing...")
+
+        # Synthesis
+        if session.status != "stopped":
+            await channel.send("Synthesizing all research into a final document...")
+            async with llm_lock:
+                synthesis = await loop.run_in_executor(
+                    None, lambda: synthesize_research(session, sync_llm)
+                )
+
+            if synthesis:
+                await channel.send(
+                    f"Final document saved: `{session.project_dir / 'final.md'}`"
+                )
+            else:
+                await channel.send("Synthesis had an issue.")
+
+            # Index into KB
+            if rag:
+                count = await loop.run_in_executor(
+                    None, lambda: index_research_notes(session, rag)
+                )
+                await channel.send(f"Indexed {count} chunks into the knowledge base.")
+
+        # Summary
+        files_list = "\n".join(f"  - `{f.name}`" for f in session.note_files)
+        await channel.send(
+            f"**Research Complete**\n"
+            f"Project: `{session.project_dir}`\n"
+            f"Files:\n{files_list}"
+        )
+
+    except asyncio.CancelledError:
+        await channel.send("Research task was cancelled.")
+    except Exception as e:
+        await channel.send(f"Research error: {e}")
+        print(f"  [Research] Error: {e}")
+    finally:
+        active_research = None
+
+
 # ─── Discord Bot ──────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
@@ -223,6 +352,8 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
+    global research_task, research_channel
+
     # Don't respond to ourselves
     if message.author == client.user:
         return
@@ -244,6 +375,61 @@ async def on_message(message):
     if not question:
         await message.reply("Ask me anything about Buddhism!")
         return
+
+    # ─── Handle !research commands ───────────────────────────────────────
+    if question.startswith("!research"):
+        parts = question.split(None, 1)
+        subcommand = parts[1] if len(parts) > 1 else ""
+
+        if subcommand.lower() == "status":
+            if active_research:
+                step_info = (
+                    f"Step {active_research.current_step + 1}/{len(active_research.steps)}"
+                    if active_research.steps else "planning"
+                )
+                await message.reply(
+                    f"**Research Status:** {active_research.status}\n"
+                    f"**Goal:** {active_research.goal}\n"
+                    f"**Progress:** {step_info}\n"
+                    f"**Project:** `{active_research.project_dir}`"
+                )
+            else:
+                await message.reply("No active research session.")
+            return
+
+        if subcommand.lower() == "stop":
+            if active_research:
+                active_research.status = "stopped"
+                await message.reply("Stopping research after current step completes...")
+            else:
+                await message.reply("No active research to stop.")
+            return
+
+        # Start new research: !research <goal>
+        if not subcommand:
+            await message.reply(
+                "**Deep Research Commands:**\n"
+                "`!research <goal>` — Start a research session\n"
+                "`!research status` — Check progress\n"
+                "`!research stop` — Stop current session"
+            )
+            return
+
+        if active_research:
+            await message.reply(
+                "A research session is already running. "
+                "Use `!research stop` to cancel it first."
+            )
+            return
+
+        # Launch research as a background task
+        research_channel = message.channel
+        research_task = asyncio.create_task(
+            run_research_background(subcommand, message.channel)
+        )
+        return
+
+    # ─── Regular message handling ────────────────────────────────────────
 
     channel_name = "DM" if is_dm else f"#{message.channel.name}"
     print(f"  [Discord] {channel_name} | {message.author}: {question[:80]}...")
@@ -286,19 +472,20 @@ async def on_message(message):
             system_with_memory = SYSTEM_PROMPT
         messages = [{"role": "system", "content": system_with_memory}] + history
 
-        # Generate response (this blocks for 30-60s, typing indicator stays active)
-        response = await loop.run_in_executor(
-            None, generate_response, messages
-        )
-
-        # If context overflow, retry with no history (just system + current question)
-        if response is None and len(history) > 1:
-            print("  [Discord] Retrying without conversation history...")
-            history[:] = [{"role": "user", "content": augmented_question}]
-            messages = [{"role": "system", "content": system_with_memory}] + history
+        # Generate response — use the lock to serialize with research
+        async with llm_lock:
             response = await loop.run_in_executor(
                 None, generate_response, messages
             )
+
+            # If context overflow, retry with no history
+            if response is None and len(history) > 1:
+                print("  [Discord] Retrying without conversation history...")
+                history[:] = [{"role": "user", "content": augmented_question}]
+                messages = [{"role": "system", "content": system_with_memory}] + history
+                response = await loop.run_in_executor(
+                    None, generate_response, messages
+                )
 
         if response is None:
             await message.reply(

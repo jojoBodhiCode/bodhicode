@@ -76,6 +76,7 @@ Ground your response in these sources and cite them where appropriate.
 CONFIG_DIR = Path.home() / ".config" / "dharma-agent"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 DRAFTS_DIR = CONFIG_DIR / "drafts"
+PROJECTS_DIR = CONFIG_DIR / "projects"
 LOG_FILE = CONFIG_DIR / "activity.log"
 
 MOLTBOOK_BASE = "https://www.moltbook.com/api/v1"
@@ -258,7 +259,7 @@ def moltbook_delete(cfg, endpoint):
 
 # ─── Ollama integration ─────────────────────────────────────────────────────
 
-def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT):
+def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT, max_tokens=1024):
     """Generate a response from a messages list.
 
     This is the single LLM entry point. Both ollama and llama-server
@@ -270,6 +271,7 @@ def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT):
         messages: List of {"role": ..., "content": ...} dicts.
                   Should include the system message as the first entry.
         temperature: Sampling temperature.
+        max_tokens: Maximum tokens to generate (default 1024).
 
     Returns:
         The assistant's response text, or None on error.
@@ -281,7 +283,7 @@ def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT):
             "messages": messages,
             "temperature": temperature,
             "top_p": 0.9,
-            "max_tokens": 1024,
+            "max_tokens": max_tokens,
         }
         try:
             print(f"  ⏳ Thinking...")
@@ -307,7 +309,7 @@ def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT):
             "options": {
                 "temperature": temperature,
                 "top_p": 0.9,
-                "num_predict": 1024,
+                "num_predict": max_tokens,
             },
         }
         try:
@@ -1510,6 +1512,90 @@ def action_auto_mode(cfg):
         print(f"  Use option [4] to review and approve/reject them.")
 
 
+# ─── Deep Research Mode (CLI) ────────────────────────────────────────────────
+
+def action_deep_research(cfg):
+    """Run an autonomous deep research session from the CLI."""
+    print("\n  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║       🔬  Deep Research Mode  🔬                        ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+    print()
+    print("  Give the agent a high-level research goal and it will autonomously")
+    print("  plan, research, write notes, and synthesize a final document.")
+    print("  Notes are saved as markdown and indexed into the knowledge base.")
+    print()
+
+    goal = input("  Research goal: ").strip()
+    if not goal:
+        print("  No goal provided. Returning to menu.")
+        return
+
+    steps_input = input("  Max research steps [8]: ").strip()
+    max_steps = int(steps_input) if steps_input.isdigit() and int(steps_input) > 0 else 8
+
+    from deep_research import DeepResearch, plan_research, execute_step, synthesize_research, index_research_notes
+
+    rag = get_rag()
+    session = DeepResearch(goal, max_steps=max_steps)
+    session.setup_dirs()
+
+    print(f"\n  Project directory: {session.project_dir}")
+    print(f"  Planning research...\n")
+
+    # Sync LLM wrapper
+    def llm_func(messages, max_tokens=1024):
+        return generate_chat(cfg, messages, temperature=TEMPERATURE_CREATIVE, max_tokens=max_tokens)
+
+    try:
+        # Phase 1: Planning
+        steps = plan_research(session, rag, llm_func)
+        print(f"\n  📋 Research plan ({len(steps)} steps):")
+        for i, (title, desc) in enumerate(steps, 1):
+            print(f"     {i}. {title}")
+        print()
+
+        # Phase 2: Research loop
+        for i in range(len(steps)):
+            title = steps[i][0]
+            print(f"  ── Step {i + 1}/{len(steps)}: {title} ──\n")
+
+            notes = execute_step(session, i, rag, llm_func)
+            if notes:
+                # Show a brief preview
+                preview = notes[:200].replace('\n', ' ')
+                print(f"  ✅ Notes saved. Preview: {preview}...\n")
+            else:
+                print(f"  ⚠️  Step failed, continuing...\n")
+
+            time.sleep(2)  # brief pause between steps
+
+        # Phase 3: Synthesis
+        print(f"\n  📝 Synthesizing research...\n")
+        synthesis = synthesize_research(session, llm_func)
+        if synthesis:
+            print(f"  ✅ Final document saved: {session.project_dir / 'final.md'}\n")
+        else:
+            print(f"  ⚠️  Synthesis failed.\n")
+
+        # Phase 4: Index into KB
+        if rag:
+            print(f"  📚 Indexing notes into knowledge base...")
+            count = index_research_notes(session, rag)
+            print(f"  ✅ Indexed {count} chunks.\n")
+
+    except KeyboardInterrupt:
+        print("\n\n  Deep research stopped.")
+
+    # Summary
+    print(f"\n  ═══ Research Complete ═══")
+    print(f"  Goal: {goal}")
+    print(f"  Project: {session.project_dir}")
+    print(f"  Files generated:")
+    for f in session.note_files:
+        print(f"    - {f.name}")
+    print()
+
+
 # ─── Main menu ───────────────────────────────────────────────────────────────
 
 def main():
@@ -1586,6 +1672,7 @@ def main():
         print("  │  [c] Chat with Dharma Scholar             │")
         print("  │  [g] Glossary (Pali/Sanskrit/Tibetan)     │")
         print("  │  [a] Autonomous mode                      │")
+        print("  │  [d] Deep research mode                   │")
         print("  │  [q] Quit                                 │")
         print("  └──────────────────────────────────────────┘")
 
@@ -1615,6 +1702,8 @@ def main():
             action_glossary(cfg)
         elif choice == "a":
             action_auto_mode(cfg)
+        elif choice == "d":
+            action_deep_research(cfg)
         elif choice in ("q", "quit", "exit"):
             print("\n  🪷 May all beings benefit. Goodbye!\n")
             break

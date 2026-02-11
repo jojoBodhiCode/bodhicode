@@ -108,11 +108,12 @@ class DharmaRAG:
         """
         is_query = len(texts) <= 2 and prefix.startswith("search_query")
         if is_query and _QUERY_DEVICE != _DEVICE:
-            self.embedder = self.embedder.to(_QUERY_DEVICE)
+            _ = self.embedder  # trigger lazy-load if needed
+            self._embedder = self._embedder.to(_QUERY_DEVICE)
             prefixed = [f"{prefix}{t}" for t in texts]
-            embeddings = self.embedder.encode(prefixed, batch_size=1)
+            embeddings = self._embedder.encode(prefixed, batch_size=1)
             torch.cuda.empty_cache()
-            self.embedder = self.embedder.to(_DEVICE)
+            self._embedder = self._embedder.to(_DEVICE)
             return embeddings.tolist()
 
         prefixed = [f"{prefix}{t}" for t in texts]
