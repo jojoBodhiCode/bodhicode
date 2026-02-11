@@ -344,6 +344,10 @@ def generate_chat(cfg, messages, temperature=TEMPERATURE_DEFAULT, max_tokens=102
     Returns:
         The assistant's response text, or None on error.
     """
+    # Guard: cap max_tokens so at least half the context is available for prompt
+    if _cli_ctx_size is not None:
+        max_tokens = min(max_tokens, _cli_ctx_size // 2)
+
     # Guard: trim prompt to fit within context window
     messages = _trim_messages_cli(cfg, messages, max_tokens)
 

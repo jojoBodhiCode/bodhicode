@@ -18,6 +18,7 @@ from typing import List, Optional
 JOURNAL_PATH = Path.home() / ".config" / "dharma-agent" / "journal.json"
 MAX_ENTRIES = 200       # total entries to keep on disk
 PROMPT_ENTRIES = 10     # entries to inject into system prompt
+MAX_PROMPT_CHARS = 1500 # cap journal text injected into prompt
 
 
 def load_journal() -> List[dict]:
@@ -96,4 +97,8 @@ def format_for_prompt() -> str:
             f"\"{e['topic']}\"{sources_str}"
         )
 
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    # Cap total size to avoid blowing up LLM context
+    if len(text) > MAX_PROMPT_CHARS:
+        text = text[:MAX_PROMPT_CHARS] + "\n[... older entries trimmed ...]"
+    return text

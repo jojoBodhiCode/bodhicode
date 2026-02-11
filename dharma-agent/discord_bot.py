@@ -221,6 +221,10 @@ def _trim_messages_to_fit(messages, max_tokens):
 
 def generate_response(messages, max_tokens=768, temperature=TEMPERATURE_FACTUAL):
     """Send messages to llama-server and get a response."""
+    # Guard: cap max_tokens so at least half the context is available for prompt
+    ctx_size = _get_server_ctx_size()
+    max_tokens = min(max_tokens, ctx_size // 2)
+
     # Guard: trim prompt to fit within context window
     messages = _trim_messages_to_fit(messages, max_tokens)
 
@@ -795,6 +799,141 @@ async def on_message(message):
         await message.reply(msg)
         return
 
+    # ─── Handle !server commands ─────────────────────────────────────────
+    if question.startswith("!server"):
+        parts = question.split(None, 1)
+        subcommand = parts[1].strip().lower() if len(parts) > 1 else ""
+
+        llama_url = get_llama_url()
+        parsed = urlparse(llama_url)
+
+        def _server_get(path):
+            """GET request to llama-server. Returns (status_code, data_dict) or (None, error_str)."""
+            try:
+                conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+                conn.request("GET", path, headers={"Accept": "application/json"})
+                resp = conn.getresponse()
+                raw = resp.read()
+                conn.close()
+                return resp.status, json.loads(raw)
+            except Exception as e:
+                return None, str(e)
+
+        def _server_post(path):
+            """POST request to llama-server. Returns (status_code, data) or (None, error_str)."""
+            try:
+                conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+                conn.request("POST", path, headers={"Content-Type": "application/json"})
+                resp = conn.getresponse()
+                raw = resp.read()
+                conn.close()
+                return resp.status, json.loads(raw) if raw else {}
+            except Exception as e:
+                return None, str(e)
+
+        loop = asyncio.get_running_loop()
+
+        if subcommand in ("clear", "reset"):
+            # Try to erase all active slots via /slots/{id}?action=erase
+            await message.reply("Attempting to clear server slots...")
+            status, data = await loop.run_in_executor(None, _server_get, "/slots")
+            if status is None:
+                await message.reply(f"Could not reach server: {data}")
+                return
+            if status != 200:
+                # /slots may not be enabled — try alternate approach
+                await message.reply(
+                    "Cannot query slots (server may need `--slots` flag). "
+                    "Try restarting llama-server manually."
+                )
+                return
+
+            if not isinstance(data, list):
+                await message.reply("Unexpected response from /slots endpoint.")
+                return
+
+            cleared = 0
+            for slot in data:
+                slot_id = slot.get("id", 0)
+                s, _ = await loop.run_in_executor(
+                    None, _server_post, f"/slots/{slot_id}?action=erase"
+                )
+                if s and s < 300:
+                    cleared += 1
+
+            # Also reset our cached context size so it gets re-queried
+            global _server_ctx_size
+            _server_ctx_size = None
+
+            await message.reply(
+                f"Cleared {cleared}/{len(data)} slots. "
+                f"Server should be responsive now."
+            )
+            return
+
+        if subcommand == "slots":
+            status, data = await loop.run_in_executor(None, _server_get, "/slots")
+            if status is None:
+                await message.reply(f"Could not reach server: {data}")
+                return
+            if status != 200:
+                await message.reply("Cannot query slots (server may need `--slots` flag).")
+                return
+
+            if not isinstance(data, list) or not data:
+                await message.reply("No slot data returned.")
+                return
+
+            state_names = {0: "idle", 1: "processing"}
+            lines = []
+            for slot in data:
+                sid = slot.get("id", "?")
+                state = state_names.get(slot.get("state"), f"unknown({slot.get('state')})")
+                n_ctx = slot.get("n_ctx", "?")
+                n_predict = slot.get("n_predict", "?")
+                prompt_len = len(slot.get("prompt", ""))
+                lines.append(
+                    f"  Slot {sid}: **{state}** | ctx: {n_ctx} | "
+                    f"n_predict: {n_predict} | prompt: {prompt_len} chars"
+                )
+
+            await message.reply(
+                f"**Server Slots** ({len(data)} total):\n" + "\n".join(lines)
+            )
+            return
+
+        # Default: !server or !server status
+        status, health = await loop.run_in_executor(None, _server_get, "/health")
+        status2, props = await loop.run_in_executor(None, _server_get, "/props")
+
+        msg = f"**LLM Server Status**\n"
+        msg += f"URL: `{llama_url}`\n"
+
+        if status is None:
+            msg += f"Health: **unreachable** ({health})\n"
+        else:
+            server_status = health.get("status", "unknown") if isinstance(health, dict) else "?"
+            msg += f"Health: **{server_status}** (HTTP {status})\n"
+
+        if status2 == 200 and isinstance(props, dict):
+            gen = props.get("default_generation_settings", {})
+            model = gen.get("model", props.get("model", "unknown"))
+            n_ctx = gen.get("n_ctx", "?")
+            msg += f"Model: `{model}`\n"
+            msg += f"Context: **{n_ctx}** tokens\n"
+
+        # Try slots count
+        status3, slots = await loop.run_in_executor(None, _server_get, "/slots")
+        if status3 == 200 and isinstance(slots, list):
+            idle = sum(1 for s in slots if s.get("state") == 0)
+            busy = sum(1 for s in slots if s.get("state") == 1)
+            msg += f"Slots: {len(slots)} total ({idle} idle, {busy} busy)\n"
+            if busy > 0:
+                msg += "\nUse `!server clear` to reset stuck slots."
+
+        await message.reply(msg)
+        return
+
     # ─── Handle !help command ────────────────────────────────────────────
     if question.strip() == "!help":
         await message.reply(
@@ -814,6 +953,10 @@ async def on_message(message):
             "`!kb search <query>` — Search the knowledge base\n"
             "`!kb traditions` — Breakdown by tradition\n"
             "`!kb types` — Breakdown by text type\n\n"
+            "**Server:**\n"
+            "`!server` — LLM server health & info\n"
+            "`!server slots` — Show slot statuses\n"
+            "`!server clear` — Reset stuck server slots\n\n"
             "Or just @mention me with a question about Buddhism!"
         )
         return

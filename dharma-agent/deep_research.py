@@ -625,8 +625,8 @@ def synthesize_research(session, llm_func):
     if not all_notes.strip():
         return None
 
-    # Truncate if too long for context
-    max_notes_chars = 6000
+    # Truncate if too long for context (conservative: ~1000 tokens of notes)
+    max_notes_chars = 4000
     if len(all_notes) > max_notes_chars:
         # Use progress summary + truncated notes
         all_notes = (
@@ -649,7 +649,7 @@ def synthesize_research(session, llm_func):
         {"role": "user", "content": prompt},
     ]
 
-    synthesis = llm_func(messages, max_tokens=4096)
+    synthesis = llm_func(messages, max_tokens=2048)
     if not synthesis:
         return None
 
