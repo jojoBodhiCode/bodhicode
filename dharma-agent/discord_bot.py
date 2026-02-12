@@ -231,13 +231,13 @@ def _trim_messages_to_fit(messages, max_tokens):
 
 # ─── LLM generation ──────────────────────────────────────────────────────────
 
-def _llm_post_stream(messages, max_tokens, temperature, per_token_timeout=30):
+def _llm_post_stream(messages, max_tokens, temperature, read_timeout=120):
     """
     Streaming HTTP POST to llama-server.
 
     Uses SSE streaming so the connection stays alive as tokens arrive.
-    No overall timeout — only a per-chunk timeout (if no data arrives
-    for per_token_timeout seconds, we give up).
+    read_timeout covers the initial prompt processing wait (can be 60s+
+    on slow hardware) and also the gap between chunks during generation.
 
     Returns the full response text or None.
     """
@@ -252,7 +252,7 @@ def _llm_post_stream(messages, max_tokens, temperature, per_token_timeout=30):
         "stream": True,
     }).encode("utf-8")
 
-    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=per_token_timeout)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=read_timeout)
     conn.request(
         "POST", "/v1/chat/completions",
         body=payload,
