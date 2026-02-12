@@ -58,7 +58,7 @@ LLAMA_SERVER_URL = "http://127.0.0.1:8080"
 MAX_HISTORY = 2           # max messages per user (keep small for context)
 DISCORD_CHAR_LIMIT = 2000  # Discord message character limit
 DEFAULT_CTX_SIZE = 8192   # fallback if /props unavailable
-DEFAULT_CHAT_TOKENS = 256 # max tokens for Discord chat replies (keep low for slow backends)
+DEFAULT_CHAT_TOKENS = 512 # max tokens for Discord chat replies
 
 # ─── LLM lock & research state ──────────────────────────────────────────────
 
@@ -231,8 +231,16 @@ def _trim_messages_to_fit(messages, max_tokens):
 
 # ─── LLM generation ──────────────────────────────────────────────────────────
 
-def _llm_post(messages, max_tokens, temperature, timeout=300):
-    """Low-level HTTP POST to llama-server. Returns response text or None."""
+def _llm_post_stream(messages, max_tokens, temperature, per_token_timeout=30):
+    """
+    Streaming HTTP POST to llama-server.
+
+    Uses SSE streaming so the connection stays alive as tokens arrive.
+    No overall timeout — only a per-chunk timeout (if no data arrives
+    for per_token_timeout seconds, we give up).
+
+    Returns the full response text or None.
+    """
     url = get_llama_url()
     parsed = urlparse(url)
 
@@ -241,10 +249,10 @@ def _llm_post(messages, max_tokens, temperature, timeout=300):
         "temperature": temperature,
         "top_p": 0.9,
         "max_tokens": max_tokens,
-        "stream": False,
+        "stream": True,
     }).encode("utf-8")
 
-    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=timeout)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=per_token_timeout)
     conn.request(
         "POST", "/v1/chat/completions",
         body=payload,
@@ -254,22 +262,41 @@ def _llm_post(messages, max_tokens, temperature, timeout=300):
         },
     )
     resp = conn.getresponse()
-    raw = resp.read()
+
+    # Read SSE stream — each event is "data: {json}\n\n"
+    full_text = []
+    buffer = ""
+    while True:
+        chunk = resp.read(4096)
+        if not chunk:
+            break
+        buffer += chunk.decode("utf-8", errors="replace")
+
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            if line == "data: [DONE]":
+                conn.close()
+                return "".join(full_text)
+            if line.startswith("data: "):
+                try:
+                    data = json.loads(line[6:])
+                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        full_text.append(content)
+                except (json.JSONDecodeError, IndexError, KeyError):
+                    continue
+
     conn.close()
-    data = json.loads(raw)
-
-    if "choices" not in data:
-        error_msg = data.get("error", {})
-        if isinstance(error_msg, dict):
-            error_msg = error_msg.get("message", str(data))
-        print(f"  [LLM] Server error: {error_msg}")
-        return None
-
-    return data["choices"][0]["message"]["content"]
+    result = "".join(full_text)
+    return result if result else None
 
 
 def generate_response(messages, max_tokens=DEFAULT_CHAT_TOKENS, temperature=TEMPERATURE_FACTUAL):
-    """Send messages to llama-server with automatic retry on timeout."""
+    """Send messages to llama-server using streaming to avoid timeouts."""
     # Guard: cap max_tokens so at least half the context is available for prompt
     ctx_size = _get_server_ctx_size()
     max_tokens = min(max_tokens, ctx_size // 2)
@@ -277,22 +304,21 @@ def generate_response(messages, max_tokens=DEFAULT_CHAT_TOKENS, temperature=TEMP
     # Guard: trim prompt to fit within context window
     messages = _trim_messages_to_fit(messages, max_tokens)
 
-    # First attempt — 10 minute timeout (2.3 tok/s needs time)
     try:
-        return _llm_post(messages, max_tokens, temperature, timeout=600)
+        return _llm_post_stream(messages, max_tokens, temperature)
     except Exception as e:
-        print(f"  [LLM] Attempt 1 failed: {e}")
+        print(f"  [LLM] Generation failed: {e}")
 
-    # Retry — strip to system + last user message, cap at 150 tokens
+    # Retry — strip to system + last user message, halve max_tokens
     print("  [LLM] Retrying with reduced prompt...")
     if len(messages) > 2:
         messages = [messages[0], messages[-1]]
-    retry_tokens = min(max_tokens, 150)
+    retry_tokens = max(max_tokens // 2, 150)
 
     try:
-        return _llm_post(messages, retry_tokens, temperature, timeout=120)
+        return _llm_post_stream(messages, retry_tokens, temperature)
     except Exception as e:
-        print(f"  [LLM] Attempt 2 failed: {e}")
+        print(f"  [LLM] Retry failed: {e}")
         return None
 
 
@@ -336,7 +362,7 @@ async def run_research_background(goal, channel, user_id, resume_session=None):
     rag = get_rag()
     loop = asyncio.get_running_loop()
 
-    def sync_llm(messages, max_tokens=512):
+    def sync_llm(messages, max_tokens=768):
         """Blocking LLM call used inside run_in_executor."""
         return generate_response(messages, max_tokens, TEMPERATURE_CREATIVE)
 
