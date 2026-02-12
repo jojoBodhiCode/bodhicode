@@ -55,9 +55,10 @@ from deep_research import (
 
 CONFIG_FILE = Path.home() / ".config" / "dharma-agent" / "config.json"
 LLAMA_SERVER_URL = "http://127.0.0.1:8080"
-MAX_HISTORY = 2           # max messages per channel (keep small for context)
+MAX_HISTORY = 2           # max messages per user (keep small for context)
 DISCORD_CHAR_LIMIT = 2000  # Discord message character limit
 DEFAULT_CTX_SIZE = 8192   # fallback if /props unavailable
+DEFAULT_CHAT_TOKENS = 256 # max tokens for Discord chat replies (keep low for slow backends)
 
 # ─── LLM lock & research state ──────────────────────────────────────────────
 
@@ -267,7 +268,7 @@ def _llm_post(messages, max_tokens, temperature, timeout=300):
     return data["choices"][0]["message"]["content"]
 
 
-def generate_response(messages, max_tokens=768, temperature=TEMPERATURE_FACTUAL):
+def generate_response(messages, max_tokens=DEFAULT_CHAT_TOKENS, temperature=TEMPERATURE_FACTUAL):
     """Send messages to llama-server with automatic retry on timeout."""
     # Guard: cap max_tokens so at least half the context is available for prompt
     ctx_size = _get_server_ctx_size()
@@ -276,20 +277,20 @@ def generate_response(messages, max_tokens=768, temperature=TEMPERATURE_FACTUAL)
     # Guard: trim prompt to fit within context window
     messages = _trim_messages_to_fit(messages, max_tokens)
 
-    # First attempt — 5 minute timeout
+    # First attempt — 10 minute timeout (2.3 tok/s needs time)
     try:
-        return _llm_post(messages, max_tokens, temperature, timeout=300)
+        return _llm_post(messages, max_tokens, temperature, timeout=600)
     except Exception as e:
         print(f"  [LLM] Attempt 1 failed: {e}")
 
-    # Retry — strip to system + last user message, halve max_tokens
+    # Retry — strip to system + last user message, cap at 150 tokens
     print("  [LLM] Retrying with reduced prompt...")
     if len(messages) > 2:
         messages = [messages[0], messages[-1]]
-    retry_tokens = min(max_tokens, 512)
+    retry_tokens = min(max_tokens, 150)
 
     try:
-        return _llm_post(messages, retry_tokens, temperature, timeout=180)
+        return _llm_post(messages, retry_tokens, temperature, timeout=120)
     except Exception as e:
         print(f"  [LLM] Attempt 2 failed: {e}")
         return None
@@ -335,7 +336,7 @@ async def run_research_background(goal, channel, user_id, resume_session=None):
     rag = get_rag()
     loop = asyncio.get_running_loop()
 
-    def sync_llm(messages, max_tokens=1024):
+    def sync_llm(messages, max_tokens=512):
         """Blocking LLM call used inside run_in_executor."""
         return generate_response(messages, max_tokens, TEMPERATURE_CREATIVE)
 

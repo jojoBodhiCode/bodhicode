@@ -453,7 +453,7 @@ def plan_research(session, rag, llm_func):
         {"role": "user", "content": prompt},
     ]
 
-    response = llm_func(messages, max_tokens=1024)
+    response = llm_func(messages, max_tokens=512)
     if not response:
         # Fallback: single generic step
         session.steps = [("Research the topic", session.goal)]
@@ -561,7 +561,7 @@ def execute_step(session, step_num, rag, llm_func):
         {"role": "user", "content": prompt},
     ]
 
-    notes = llm_func(messages, max_tokens=2048)
+    notes = llm_func(messages, max_tokens=768)
     if not notes:
         return None
 
@@ -597,7 +597,7 @@ def execute_step(session, step_num, rag, llm_func):
             previous_progress=session.progress_summary or "(No previous progress.)",
         )},
     ]
-    summary_response = llm_func(summary_messages, max_tokens=512)
+    summary_response = llm_func(summary_messages, max_tokens=256)
     if summary_response:
         summary, gaps, plan_suggestion = _parse_summary_response(summary_response)
         if summary:
@@ -658,7 +658,7 @@ def synthesize_research(session, llm_func):
         {"role": "user", "content": prompt},
     ]
 
-    synthesis = llm_func(messages, max_tokens=2048)
+    synthesis = llm_func(messages, max_tokens=1024)
     if not synthesis:
         return None
 
@@ -702,7 +702,7 @@ def identify_gaps(session, llm_func):
         {"role": "user", "content": prompt},
     ]
 
-    response = llm_func(messages, max_tokens=512)
+    response = llm_func(messages, max_tokens=256)
     if not response:
         return []
 
