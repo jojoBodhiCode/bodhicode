@@ -231,13 +231,17 @@ def _trim_messages_to_fit(messages, max_tokens):
 
 # ─── LLM generation ──────────────────────────────────────────────────────────
 
-def _llm_post_stream(messages, max_tokens, temperature, read_timeout=120):
+def _llm_post_stream(messages, max_tokens, temperature, prompt_timeout=300,
+                     chunk_timeout=120):
     """
     Streaming HTTP POST to llama-server.
 
     Uses SSE streaming so the connection stays alive as tokens arrive.
-    read_timeout covers the initial prompt processing wait (can be 60s+
-    on slow hardware) and also the gap between chunks during generation.
+    prompt_timeout  — seconds to wait for the server to finish prompt
+                      processing and send the first data (can be 240s+
+                      on slow CPU hardware).
+    chunk_timeout   — seconds to wait between successive SSE chunks once
+                      generation has started.
 
     Returns the full response text or None.
     """
@@ -252,7 +256,9 @@ def _llm_post_stream(messages, max_tokens, temperature, read_timeout=120):
         "stream": True,
     }).encode("utf-8")
 
-    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=read_timeout)
+    # Use the long prompt_timeout for the initial connection + prompt eval
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port,
+                                      timeout=prompt_timeout)
     conn.request(
         "POST", "/v1/chat/completions",
         body=payload,
@@ -266,6 +272,7 @@ def _llm_post_stream(messages, max_tokens, temperature, read_timeout=120):
     # Read SSE stream — each event is "data: {json}\n\n"
     full_text = []
     buffer = ""
+    got_first_token = False
     while True:
         chunk = resp.read(4096)
         if not chunk:
@@ -287,6 +294,10 @@ def _llm_post_stream(messages, max_tokens, temperature, read_timeout=120):
                     content = delta.get("content", "")
                     if content:
                         full_text.append(content)
+                        # After first real token, tighten the timeout
+                        if not got_first_token:
+                            got_first_token = True
+                            conn.sock.settimeout(chunk_timeout)
                 except (json.JSONDecodeError, IndexError, KeyError):
                     continue
 
